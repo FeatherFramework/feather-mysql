@@ -2,7 +2,7 @@
 
 **0.1.0 — Initial release**
 
-A standalone MySQL/MariaDB resource for FiveM and RedM. Use plain Lua `DB.*` calls backed by a pooled mysql2 transport. No Feather framework dependency is required.
+A standalone MySQL/MariaDB resource for FiveM and RedM. Use plain Lua `DB.*` calls backed by a pooled mysql2 transport.
 
 ```lua
 local user = DB.one('SELECT * FROM users WHERE identifier = ?', identifier)
