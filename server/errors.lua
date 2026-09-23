@@ -13,5 +13,7 @@ function FeatherMySQL.error(code, message, resource, method, id, driverCode, ext
         outcome = type(extra.outcome) == 'string' and extra.outcome or defaultOutcome[code],
         sqlState = type(extra.sqlState) == 'string' and extra.sqlState or nil,
         detail = type(extra.detail) == 'string' and extra.detail or nil,
+        rollbackConfirmed = extra.rollbackConfirmed == true,
+        rollbackError = type(extra.rollbackError) == 'table' and extra.rollbackError or nil,
     }
 end

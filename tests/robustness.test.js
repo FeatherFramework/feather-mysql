@@ -706,60 +706,62 @@ test('stress: a clean driver instance accepts work after provider replacement', 
     await idle(second.driver, second.pool);
 });
 
-test('batch: every statement runs on one connection and the whole list commits', async t => {
-    const { pool, driver } = fixture(t, { limit: 2 });
-    const done = await driver.batch('consumer', [
-        { sql: 'WRITE', parameters: ['a', 1] }, { sql: 'WRITE', parameters: ['b', 2] }, { sql: 'CONNECTION_ID', parameters: [] },
-    ]);
-    assert.equal(done, true);
-    assert.deepEqual([pool.rows.get('a'), pool.rows.get('b')], [1, 2]);
-    const used = new Set(pool.events.filter(event => event.kind === 'execute' || event.sql === 'START TRANSACTION' || event.sql === 'COMMIT').map(event => event.id));
-    assert.equal(used.size, 1, 'One physical connection carried the whole transaction');
-    assert.equal(pool.events.filter(event => event.sql === 'COMMIT').length, 1);
-    await idle(driver, pool);
-});
-
-test('batch: a failing statement rolls everything back and raises its error', async t => {
-    const { pool, driver } = fixture(t, { limit: 1 });
-    pool.hook = async ({ sql }) => { if (sql === 'FAIL') throw Object.assign(new Error('secret'), { code: 'ER_DUP_ENTRY', errno: 1062, sqlState: '23000' }); };
-    await assert.rejects(driver.batch('consumer', [
-        { sql: 'WRITE', parameters: ['a', 1] }, { sql: 'FAIL', parameters: [] }, { sql: 'WRITE', parameters: ['b', 2] },
-    ]), { code: 'ER_DUP_ENTRY' });
-    assert.equal(pool.rows.size, 0, 'The first write was rolled back');
-    assert.equal(pool.events.filter(event => event.sql === 'COMMIT').length, 0);
-    assert.equal(pool.events.some(event => event.parameters?.[0] === 'b'), false, 'Nothing runs after the failure');
-    await idle(driver, pool);
-    assert.equal((await driver.run('SELECT ?', [1])).rows[0].value, 1, 'The connection is usable afterwards');
-});
-
-test('batch: a malformed statement never leaves a transaction open', async t => {
-    const { pool, driver } = fixture(t, { limit: 1 });
-    await assert.rejects(driver.batch('consumer', [{ sql: 'WRITE', parameters: ['a', 1] }, { parameters: [] }]));
-    assert.equal(pool.rows.size, 0);
-    await idle(driver, pool);
-});
-
-test('batch: the per-resource transaction limit applies', async t => {
-    const { pool, driver } = fixture(t, { limit: 3, options: { maxTransactionsPerOwner: 1 } });
-    const held = await driver.begin('greedy');
-    await assert.rejects(driver.batch('greedy', [{ sql: 'WRITE', parameters: ['a', 1] }]), { code: 'TRANSACTION_LIMIT' });
-    assert.equal(await driver.batch('polite', [{ sql: 'WRITE', parameters: ['p', 1] }]), true);
-    await driver.finish('greedy', held.id, false);
-    await idle(driver, pool);
-});
-
 test('readiness: false until a probe reaches the database, and the failure code is kept', async t => {
     const { pool, driver } = fixture(t);
-    assert.deepEqual(driver.readiness(), { ready: false, code: null }, 'Nothing is probed by construction');
+    assert.deepEqual(driver.readiness(), { ready: false, code: null, health: 'starting' }, 'Nothing is probed by construction');
     assert.equal(pool.getCalls, 0, 'No connection is opened until asked');
     pool.hook = async ({ sql }) => { if (sql === 'SELECT 1') throw Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }); };
     assert.equal(await driver.probe(), false);
-    assert.deepEqual(driver.readiness(), { ready: false, code: 'ECONNREFUSED' });
+    assert.deepEqual(driver.readiness(), { ready: false, code: 'ECONNREFUSED', health: 'starting' },
+        'Never having reached the database is "starting", not "unavailable"');
     pool.hook = async () => {};
     assert.equal(await driver.probe(), true);
-    assert.deepEqual(driver.readiness(), { ready: true, code: null });
+    assert.deepEqual(driver.readiness(), { ready: true, code: null, health: 'connected' });
     assert.equal(driver.diagnostics().ready, true);
+    assert.equal(driver.diagnostics().health, 'connected');
     await idle(driver, pool);
+});
+test('healthState: unavailable once the database was reachable before and is not now', async t => {
+    const { pool, driver } = fixture(t);
+    assert.equal(await driver.probe(), true);
+    assert.equal(driver.healthState(), 'connected');
+    pool.hook = async ({ sql }) => { if (sql === 'SELECT 1') throw Object.assign(new Error('down'), { code: 'PROTOCOL_CONNECTION_LOST' }); };
+    assert.equal(await driver.probe(), false);
+    assert.equal(driver.healthState(), 'unavailable', 'It was connected before, so this is not "starting"');
+    await idle(driver, pool);
+});
+test('healthState: degraded once a meaningful share of recent requests fail, and recovers', async t => {
+    const { pool, driver } = fixture(t);
+    assert.equal(await driver.probe(), true);
+    assert.equal(driver.healthState(), 'connected', 'Too little data yet to call it either way');
+    pool.hook = async ({ sql }) => { if (sql === 'WRITE') throw Object.assign(new Error('rejected'), { code: 'ER_PARSE_ERROR', errno: 1064, sqlState: '42000' }); };
+    for (let i = 0; i < 4; i++) await assert.rejects(driver.run('WRITE', []));
+    assert.equal(driver.healthState(), 'connected', 'Fewer than 5 recent requests: not enough to call it degraded');
+    await assert.rejects(driver.run('WRITE', []));
+    assert.equal(driver.healthState(), 'degraded', '5 of 5 recent requests failed');
+    pool.hook = async () => {};
+    for (let i = 0; i < 20; i++) await driver.run('SELECT 1', []);
+    assert.equal(driver.healthState(), 'connected', 'The 5 failures are now a small enough share of the 25 recent requests (20%, not over threshold)');
+    await idle(driver, pool);
+});
+test('the health probe itself never counts toward healthState\'s recent-failure ratio', async t => {
+    const { pool, driver } = fixture(t);
+    pool.hook = async ({ sql }) => { if (sql === 'SELECT 1') throw Object.assign(new Error('down'), { code: 'ECONNREFUSED' }); };
+    for (let i = 0; i < 10; i++) await driver.probe();
+    assert.equal(driver.totals.errors, 10, 'The general error counter does count the probe');
+    assert.equal(driver.recentOutcomes.length, 0, 'But it uses owner "health", so it never reaches the degraded-ratio tracker');
+    await idle(driver, pool);
+});
+test('diagnostics reports acquire/execute/cleanup latency separately', async t => {
+    const { pool, driver } = fixture(t);
+    assert.deepEqual(driver.diagnostics().latencies.executeMs, { count: 0, p50: null, p95: null, p99: null });
+    await driver.run('SELECT 1', []);
+    await idle(driver, pool);
+    const { latencies } = driver.diagnostics();
+    for (const phase of ['acquireMs', 'executeMs', 'cleanupMs']) {
+        assert.equal(latencies[phase].count, 1, phase);
+        assert.equal(typeof latencies[phase].p50, 'number', phase);
+    }
 });
 
 test('readiness: the start-up loop retries with a pause, reports transitions, then stops', async t => {
@@ -783,4 +785,52 @@ test('readiness: closing the provider ends a waiting probe loop promptly', async
     await driver.close();
     assert.equal(await waiting, false);
     assert.equal(Date.now() - started < 500, true, 'It did not sleep out its retry interval');
+});
+
+test('monitor: a later outage and recovery are reflected in readiness()/healthState(), not just the first connection', async t => {
+    const { pool, driver } = fixture(t);
+    assert.equal(await driver.probe(), true, 'Reachable at start, like a real awaitDatabase() success');
+    assert.deepEqual(driver.readiness(), { ready: true, code: null, health: 'connected' });
+
+    const reports = [];
+    const running = driver.monitor((ready, code) => reports.push([ready, code]), 10);
+
+    pool.hook = async ({ sql }) => { if (sql === 'SELECT 1') throw Object.assign(new Error('down'), { code: 'PROTOCOL_CONNECTION_LOST' }); };
+    while (driver.readiness().ready) await turn();
+    assert.deepEqual(driver.readiness(), { ready: false, code: 'PROTOCOL_CONNECTION_LOST', health: 'unavailable' },
+        'The outage is now visible without any caller traffic and without a manual probe() call');
+
+    pool.hook = async () => {};
+    while (!driver.readiness().ready) await turn();
+    assert.deepEqual(driver.readiness(), { ready: true, code: null, health: 'connected' }, 'Recovery is visible the same way');
+
+    assert.deepEqual(reports, [[false, 'PROTOCOL_CONNECTION_LOST'], [true, null]], 'Reported exactly on the two transitions, nothing in between');
+
+    await driver.close();
+    await running;
+    await idle(driver, pool);
+});
+
+test('monitor: a probe that does not change reachability reports nothing', async t => {
+    const { pool, driver } = fixture(t);
+    assert.equal(await driver.probe(), true);
+    const reports = [];
+    const running = driver.monitor((ready, code) => reports.push([ready, code]), 10);
+    await new Promise(resolve => setTimeout(resolve, 55));
+    await driver.close();
+    await running;
+    assert.deepEqual(reports, [], 'Still reachable on every tick: nothing to report');
+    await idle(driver, pool);
+});
+
+test('monitor: closing the provider ends it promptly instead of waiting out the interval', async t => {
+    const { pool, driver } = fixture(t);
+    assert.equal(await driver.probe(), true);
+    const running = driver.monitor(() => {}, 10000);
+    await turn();
+    const started = Date.now();
+    await driver.close();
+    await running;
+    assert.equal(Date.now() - started < 500, true, 'It did not sleep out the 10s interval');
+    await idle(driver, pool);
 });

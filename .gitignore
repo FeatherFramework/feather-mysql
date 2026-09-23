@@ -1,2 +1,6 @@
 node_modules/
 *.log
+
+# Local review prompts, not release documentation
+docs/codex-audit.MD
+docs/claude-audit.MD

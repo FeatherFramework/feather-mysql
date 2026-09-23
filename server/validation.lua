@@ -1,5 +1,5 @@
 -- `raw` returns rows for statements that produce rows and a write header otherwise. It exists for
--- callers that cannot know the statement kind in advance (the oxmysql compatibility layer).
+-- callers that cannot know the statement kind in advance; see DB.raw's own comment in lib/DB.lua.
 local methods = { query = true, one = true, value = true, insert = true, exec = true, raw = true }
 local MAX_SAFE_INTEGER = 9007199254740991
 

@@ -29,7 +29,7 @@ const KNOWN = {
     RESULT_TYPE: ['Unsupported result set; statement may already have executed', 'executed'],
 };
 
-function publicError(error, { detail = false } = {}) {
+function publicError(error, { detail = false, includeRollback = true } = {}) {
     const code = error?.code;
     let result;
     if (Object.hasOwn(KNOWN, code)) {
@@ -40,17 +40,22 @@ function publicError(error, { detail = false } = {}) {
             result.outcome = 'unknown';
             result.message = 'Database transaction timed out while committing; the COMMIT outcome may be unknown';
         }
-        return result;
-    }
-    if (isStatementError(error)) {
+    } else if (isStatementError(error)) {
         result = { code: 'DATABASE_ERROR', message: 'Database rejected the statement', outcome: 'failed', sqlState: error.sqlState };
     } else {
         result = { code: 'DATABASE_ERROR', message: 'Database operation failed; write outcome may be unknown', outcome: 'unknown' };
     }
     // Raw driver messages can contain SQL, values and credentials, so they are
     // opt-in (feather_mysql_error_detail) and never logged by default.
-    if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code)) result.driverCode = code;
+    if (!Object.hasOwn(KNOWN, code) && typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code)) result.driverCode = code;
     if (detail && typeof error?.sqlMessage === 'string') result.detail = error.sqlMessage.slice(0, MAX_DETAIL);
+    if (typeof error?.rollbackConfirmed === 'boolean') {
+        result.rollbackConfirmed = error.rollbackConfirmed;
+        result.outcome = error.rollbackConfirmed ? 'rolled_back' : 'unknown';
+    }
+    if (includeRollback && error?.rollbackError) {
+        result.rollbackError = publicError(error.rollbackError, { detail, includeRollback: false });
+    }
     return result;
 }
 

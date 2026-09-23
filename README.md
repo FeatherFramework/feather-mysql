@@ -1,6 +1,8 @@
 # Feather MySQL
 
-A small, dependable MySQL/MariaDB layer for FiveM and RedM servers. You write plain Lua, it talks to the database.
+**0.1.0 — Initial release**
+
+A standalone MySQL/MariaDB resource for FiveM and RedM. Use plain Lua `DB.*` calls backed by a pooled mysql2 transport. No Feather framework dependency is required.
 
 ```lua
 local user = DB.one('SELECT * FROM users WHERE identifier = ?', identifier)
@@ -8,11 +10,10 @@ local user = DB.one('SELECT * FROM users WHERE identifier = ?', identifier)
 
 - **Five small functions** (`query`, `one`, `value`, `insert`, `exec`) and real **transactions**.
 - **Safe by default.** Values are always sent as parameters, never pasted into SQL.
-- **Steady under load.** A busy pool queues requests instead of failing them, and a timed-out statement is cancelled on the server.
-- **Clear errors.** Every error says which resource called, what failed, and whether the change was applied.
-- **Works with existing scripts.** An optional `MySQL.*` adapter lets scripts written in that style run unchanged.
+- **Bounded requests.** A busy pool queues requests up to its configured limit. Deadlines stop waiting, and cancellation on the database server is best effort.
+- **Structured errors.** Errors identify the caller and failure, and report when a write outcome is unknown.
 
-Tested on RedM with MariaDB 11.8. See [Limits](#limits).
+Includes automated Node, Lua and isolated MariaDB checks. Validate startup, shutdown and your resource workflows on a staging server before deployment. See [Limits](#limits).
 
 ## Install
 
@@ -86,8 +87,8 @@ More examples, including player events and exporting your own API, are in [docs/
 
 | SQL type | Lua value |
 | --- | --- |
-| `INT`, `BIGINT` up to 2^53, `COUNT(*)` | number |
-| `BIGINT` above 2^53 | string (exact) |
+| `INT`, `BIGINT` within ±(2^53−1), `COUNT(*)` | number |
+| `BIGINT` outside that range | string (exact) |
 | `DECIMAL`, and `SUM()` of integers | string (exact, never rounded) |
 | `FLOAT`, `DOUBLE` | number |
 | dates, times, JSON | string |
@@ -107,12 +108,14 @@ local ok, committed = pcall(DB.transaction, function(tx)
 end)
 ```
 
-- `tx` has the same five functions as `DB`. All of them run on one database connection.
+- `tx` has the same query functions as `DB`, including `raw`. All run on the connection that began the transaction.
 - Return `true` to commit. Returning `false` **or nothing** rolls back, so check the result.
-- Any error rolls back and is raised. Catching an error inside the callback does not let it commit.
-- Use `tx.*`, not `DB.*`, inside the callback: `DB.*` runs on a different connection and is not part of the transaction. A warning names the file and line of the call, once per place (every time with `feather_mysql_devmode`). With the `MySQL.*` adapter, use the `query` function the callback receives.
+- Any error prevents commit, attempts rollback and is raised. Catching a query error inside the callback does not let it commit. A failed rollback confirmation reports `outcome = 'unknown'`.
+- Use `tx.*`, not `DB.*`, inside the callback: `DB.*` runs on a different connection and is not part of the transaction. A warning names the file and line of the call, once per place (every time with `feather_mysql_devmode`).
 - Keep transactions short. Each holds a connection, and a resource may hold at most half the pool by default.
 - Do not nest `DB.transaction` in the same coroutine.
+- Set `feather_mysql_retry_deadlocks true` to enable bounded retries for deadlocks and lock-wait timeouts. It is off by default. Transactions retry only after rollback is confirmed, using a fresh connection lease and `BEGIN`. A provider stop cancels pending retries.
+- A retry runs the **whole callback again**. Use this option only when callbacks have no side effects outside `tx.*`, such as events or changes to shared Lua tables. The same switch also retries standalone statements. `feather_mysql_retry_deadlocks_max` (default `3`, range `0–20`) counts retries after the first attempt.
 
 ## Errors
 
@@ -126,7 +129,7 @@ if not ok then
 end
 ```
 
-Fields: `code`, `message`, `resource`, `method`, `queryId`, `driverCode`, `sqlState`, `outcome`, `traceback`.
+Fields: `code`, `message`, `resource`, `method`, `queryId`, `driverCode`, `sqlState`, `outcome`, `traceback`. Where available, `rollbackConfirmed` records an acknowledged rollback and `rollbackError` describes a failure during rollback.
 
 `outcome` tells you what to assume about the database:
 
@@ -138,7 +141,7 @@ Fields: `code`, `message`, `resource`, `method`, `queryId`, `driverCode`, `sqlSt
 | `executed` | It ran, but the result did not match the function you used. |
 | `unknown` | Timeout, disconnect or stop. It may or may not have been applied: do not blindly retry a write. |
 
-Codes: `INVALID_ARGUMENT`, `INVALID_CONTEXT`, `INVALID_CALLBACK`, `INVALID_CALLER`, `UNAVAILABLE`, `CONFIG_ERROR`, `DATABASE_ERROR`, `RESULT_TYPE`, `QUERY_TIMEOUT`, `POOL_EXHAUSTED`, `RESOURCE_STOPPED`, `BRIDGE_ERROR`, `WATCHDOG_TIMEOUT`, `UNSUPPORTED_API`, and for transactions `TRANSACTION_TIMEOUT`, `TRANSACTION_CLOSED`, `TRANSACTION_OWNER`, `TRANSACTION_BUSY`, `TRANSACTION_LIMIT`, `NESTED_TRANSACTION`, `LUA_ERROR`.
+Codes: `INVALID_ARGUMENT`, `INVALID_CONTEXT`, `INVALID_CALLER`, `UNAVAILABLE`, `CONFIG_ERROR`, `DATABASE_ERROR`, `RESULT_TYPE`, `QUERY_TIMEOUT`, `POOL_EXHAUSTED`, `RESOURCE_STOPPED`, `BRIDGE_ERROR`, `WATCHDOG_TIMEOUT`, and for transactions `TRANSACTION_TIMEOUT`, `TRANSACTION_CLOSED`, `TRANSACTION_OWNER`, `TRANSACTION_BUSY`, `TRANSACTION_LIMIT`, `NESTED_TRANSACTION`, `LUA_ERROR`.
 
 ## Configuration
 
@@ -150,7 +153,7 @@ set mysql_connection_string "host=127.0.0.1;port=3306;user=app;password=secret;d
 
 Keys: `host`, `port`, `user`, `password`, `database`, `charset`, `connectionLimit` (default 10), `queueLimit` (default 512), `connectTimeout` (ms, default 10000), `ssl` (`true` verifies the server certificate). `user` and `database` are required. Unknown keys are rejected, and errors never print the connection string.
 
-Optional convars, all read at startup:
+Optional convars are read at startup. Lua transaction retry settings and Lua development warnings are also read live:
 
 | Convar | Default | Meaning |
 | --- | --- | --- |
@@ -158,6 +161,8 @@ Optional convars, all read at startup:
 | `feather_mysql_transaction_timeout_ms` | `10000` | Deadline for a transaction's work; COMMIT/ROLLBACK get their own window |
 | `feather_mysql_cleanup_timeout_ms` | `5000` | Deadline for resetting a connection after use |
 | `feather_mysql_max_transactions_per_resource` | half the pool | Open transactions one resource may hold; `0` removes the limit |
+| `feather_mysql_retry_deadlocks` | `false` | `true` automatically retries a standalone statement, or a whole `DB.transaction` callback, once the database reports a deadlock or a lock-wait timeout |
+| `feather_mysql_retry_deadlocks_max` | `3` | Retries on top of the first attempt, when the above is on. Bounded to 0-20 |
 | `feather_mysql_devmode` | `false` | `true` turns on every log below by default (queries, transactions, SQL text) and reports each misused call every time. An explicit setting of any of them still wins. Leave it off in production |
 | `feather_mysql_slow_query_ms` | `200` | Log queries and transactions at or above this; `0` disables |
 | `feather_mysql_log_queries` | `false` | Log every request (metadata only) |
@@ -166,53 +171,20 @@ Optional convars, all read at startup:
 | `feather_mysql_max_error_logs_per_second` | `20` | Cap on error log lines, so an outage cannot flood the console; `0` removes the cap |
 | `feather_mysql_error_detail` | `false` | Add the database's own message to errors as `detail` (it can contain values) |
 
-Values and connection strings are never logged.
+Bound parameters and connection strings are not logged by default. SQL logging exposes literals written into SQL text; `feather_mysql_error_detail` can expose values in database error messages. Keep these options off in production.
 
-## Existing scripts: the `MySQL.*` adapter
+## Public service contract
 
-A script already written with `MySQL.query`, `MySQL.single`, `MySQL.scalar`, `MySQL.insert` and `MySQL.update` can run on this resource. In its manifest, import the adapter instead of `DB.lua` and depend on this resource:
-
-```lua
-dependency 'feather-mysql'
-server_scripts {
-    '@feather-mysql/lib/MySQL.lua',
-    'server.lua',
-}
-```
-
-Supported, each with a callback form and `.await`: `query`, `single`, `scalar`, `insert`, `update`, `prepare` and `transaction`. Also `MySQL.startTransaction`, `MySQL.ready`, `MySQL.isReady` and `MySQL.awaitConnection`.
-
-- `MySQL.query` returns rows for a read and `{ affectedRows, insertId, warningStatus }` for a write.
-- `MySQL.prepare(sql, list)` runs the statement once per parameter list in `list`, all in one transaction.
-- `MySQL.startTransaction(function(query) ... end)` **commits unless the callback returns `false`**. This differs from `DB.transaction`, where returning nothing rolls back.
-- `MySQL.transaction` and `MySQL.startTransaction` return `true` when committed and `false` otherwise (the reason is printed).
-- Named placeholders work in the adapter and the exports: `WHERE id = @id` (or `:id`) with `{ id = 5 }`, `{ ['@id'] = 5 }` or `{ [':id'] = 5 }`. They are rewritten to positional `?` before anything is sent, so values are still bound and never pasted in. A name used twice is bound twice. User variables (`@rownum`), `@@system` variables and text inside quotes or comments are left alone. A table that does not match the statement (a mistyped name, or keys the statement never uses) is refused with `INVALID_ARGUMENT` and nothing is sent. The native `DB.*` functions take positional values only.
-- Anything else raises `UNSUPPORTED_API`.
-- Errors from the adapter's `.await` calls are raised as text, as they are by the library it replaces: `[feather-mysql] DATABASE_ERROR: Database rejected the statement (method=query driverCode=ER_PARSE_ERROR ...)` followed by the stack trace of your call. A callback receives the error table instead.
-
-The same calls are available as exports, for a resource that would rather not import the Lua file:
-
-### Public service contracts
-
-```lua
-exports['feather-mysql']:query(sql, parameters?, callback?)
-exports['feather-mysql']:single(sql, parameters?, callback?)
-exports['feather-mysql']:scalar(sql, parameters?, callback?)
-exports['feather-mysql']:insert(sql, parameters?, callback?)
-exports['feather-mysql']:update(sql, parameters?, callback?)
-
-exports['feather-mysql']:transaction(queries, callback?)
-
-exports['feather-mysql']:isReady(callback?)
-```
-
-Failures are printed and answered with `nil` (`false` for `transaction` and `isReady`) instead of raising. Without a callback the call waits for the result inside your coroutine; with one it returns at once. `query` returns rows for a read and a header (`affectedRows`, `insertId`) for a write, and `update` returns the affected-row count as a number.
-
-This is the whole public contract. `ExecuteV1`, `ReadyV1`, `BeginTransactionV1`, `TransactionQueryV1` and `FinishTransactionV1` are also reachable through `exports['feather-mysql']`, but they are the internal protocol `lib/DB.lua` and `lib/MySQL.lua` use to talk to this resource, not a stable API: call the functions above, or import one of those two files, instead of calling those directly.
+Importing `@feather-mysql/lib/DB.lua` is the only supported way to use this resource. `ExecuteV1`, `ReadyV1`, `BeginTransactionV1`, `TransactionQueryV1` and `FinishTransactionV1` are reachable through `exports['feather-mysql']`, but they are the internal protocol `lib/DB.lua` uses to talk to this resource, not a stable API: call `DB.*` instead of calling those directly.
 
 ## Diagnostics
 
-- **Console command** `feather_mysql_diagnostics` prints pool, queue, transaction and counter state as JSON.
+- **Console command** `feather_mysql_diagnostics` prints pool, queue, transaction and counter state as JSON, including:
+  - `health`: `starting` (never reached the database yet), `connected`, `degraded` (reachable, but a
+    meaningful share of recent requests have failed), or `unavailable` (was reachable, isn't now).
+  - `latencies`: `acquireMs`/`executeMs`/`cleanupMs`, each as `{ count, p50, p95, p99 }` over a rolling
+    window of recent calls — acquiring a connection, running the statement on the server, and the
+    session reset after answering, measured separately.
 - **Slow queries** and every error are logged with the calling resource, method, duration, `driverCode`, `sqlState` and `outcome`.
 
 ## Tests
@@ -223,15 +195,19 @@ npm run verify
 
 This runs the Node tests, the Lua tests (Lua 5.4 library required; `python3 tests/run_lua.py`), and a suite against a private throwaway MariaDB that it starts and stops itself. That last part needs `mariadbd` and `mariadb-install-db` installed, and a short temporary directory path (Unix socket paths are limited to 107 characters). It never touches your real database.
 
-The companion `feather-mysql-test` resource adds console checks that run on a real server and database: `feather_mysql_test`, `feather_mysql_test_transactions` and `feather_mysql_test_compat`. Use a test database.
+The companion `feather-mysql-test` resource adds console checks that run on a real server and database: `feather_mysql_test` and `feather_mysql_test_transactions`. Use a test database.
+
+`npm run bench` uses the same private-MariaDB setup to measure driver latency and throughput alongside a minimal mysql2 text-query baseline. The baseline skips session resets and is not feature-equivalent. Measurements exclude Cfx/Lua transport overhead and do not establish a production performance ranking.
 
 ## Limits
 
 - One statement per call. Multi-statement SQL and stored procedures that return several result sets are not supported. Results are held in memory, not streamed.
 - A statement the server cannot prepare with a placeholder (for example `SHOW COLUMNS ... LIKE ?`) is retried once as text, with the values escaped by the driver. The retry is refused for `??` placeholders, mismatched value counts, multibyte connection character sets and servers using `NO_BACKSLASH_ESCAPES`.
 - Binary values cannot be sent as parameters; binary results arrive as arrays of bytes.
-- Tested on RedM with MariaDB 11.8. FiveM, MySQL 8 and TLS have not been tested.
-- Caching, a public prepared-statement API and automatic retries are not included.
+- Automated integration coverage uses MariaDB. Live Cfx startup/restart behavior, FiveM, MySQL 8 and TLS require deployment validation.
+- Transaction rollback guarantees require transactional tables such as InnoDB. Avoid DDL and other implicit-commit statements inside callbacks.
+- Cancellation is not immediate server cancellation. A timed-out write or COMMIT may have an unknown outcome; do not blindly retry it.
+- Caching and a public prepared-statement API are not included.
 
 ## License
 

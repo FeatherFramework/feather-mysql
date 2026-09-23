@@ -4,6 +4,8 @@ local tests, registered, handlers = 0, {}, {}
 local caller, state = 'transaction-consumer', 'started'
 local history, transactions, sequence = {}, {}, 0
 local failFinish, failBegin, holdQuery, held, malformed = nil, nil, false, nil, nil
+-- How many more times request.sql == 'DEADLOCK' fails before it succeeds.
+local deadlocksRemaining = 0
 local lastRequest, lastOwner, resolutions = nil, nil, 0
 function GetConvar(_, default) return default end
 function GetCurrentResourceName() return 'feather-mysql' end
@@ -49,6 +51,13 @@ local function result(request, tx)
     elseif request.sql == 'DUPLICATE' then
         if tx then tx.failure = 'DATABASE_ERROR' end
         return { ok = false, error = { code = 'DATABASE_ERROR', message = 'Duplicate', driverCode = 'ER_DUP_ENTRY' } }
+    elseif request.sql == 'DEADLOCK' then
+        if deadlocksRemaining > 0 then
+            deadlocksRemaining = deadlocksRemaining - 1
+            if tx then tx.failure = 'DATABASE_ERROR' end
+            return { ok = false, error = { code = 'DATABASE_ERROR', message = 'Deadlock', driverCode = 'ER_LOCK_DEADLOCK' } }
+        end
+        return response({ kind = 'write', header = { insertId = 0, affectedRows = 1 } })
     elseif request.sql:find('SELECT', 1, true) then
         return response({ kind = 'rows', firstColumn = 'z', first = tx and tx.id or 'pool', rows = { { z = tx and tx.id or 'pool' }, { z = 2 } } })
     end
@@ -94,7 +103,13 @@ exports = setmetatable({}, {
                     tx.commit = commit
                     if tx.owner ~= owner then callback(rejected('TRANSACTION_OWNER'))
                     elseif failFinish then callback(rejected(failFinish))
-                    elseif tx.failure then callback(rejected(tx.failure))
+                    elseif tx.failure then
+                        local reply = rejected(tx.failure)
+                        if tx.failure == 'DATABASE_ERROR' then
+                            reply.error.rollbackConfirmed = true
+                            reply.error.outcome = 'rolled_back'
+                        end
+                        callback(reply)
                     else callback(response(commit)) end
                 else error('Unknown bridge export ' .. name) end
             end
@@ -160,6 +175,7 @@ check('SQL failure rolls back and retains code and driver detail', function()
         DB.transaction(function(tx) tx.query('FAIL'); return true end)
     end)
     assert(failure.driverCode == 'ER_PARSE_ERROR' and latest().closed and not latest().commit)
+    assert(failure.outcome == 'rolled_back' and failure.rollbackError == nil)
 end)
 check('caught SQL failure poisons transaction and prevents later queries and commit', function()
     expect('DATABASE_ERROR', function()
@@ -381,7 +397,7 @@ check('transaction errors are readable, keep their cause and say what to assume'
     assert(text:find('LUA_ERROR', 1, true) and text:find('callback exploded', 1, true) and text:find('outcome=rolled_back', 1, true))
     assert(type(failure.traceback) == 'string')
     local nested = expect('NESTED_TRANSACTION', function() DB.transaction(function() DB.transaction(function() return true end) end) end)
-    assert(nested.outcome == 'not_executed')
+    assert(nested.outcome == 'rolled_back')
     local closed
     DB.transaction(function(tx) closed = tx; return true end)
     assert(expect('TRANSACTION_CLOSED', function() closed.value('SELECT 1') end).outcome == 'not_executed')
@@ -396,8 +412,158 @@ check('a non-table failure while waiting for the provider becomes a structured e
         DB.transaction(function(tx) armed = true; tx.value('SELECT 1'); return true end)
     end)
     Citizen.Await = realAwait
-    assert(type(failure) == 'table' and failure.outcome == 'unknown' and failure.message:find('await exploded', 1, true))
+    assert(type(failure) == 'table' and failure.outcome == 'rolled_back' and failure.message:find('await exploded', 1, true))
     assert(latest().closed and not latest().commit, 'The transaction was rolled back, not committed')
     assert(DB.transaction(function() return true end), 'Later transactions work')
+end)
+-- feather_mysql_retry_deadlocks/_max, read live like feather_mysql_devmode; Wait is stubbed so a
+-- retry's backoff does not suspend the coroutine check() only resumes once.
+local function withRetry(enabled, max, fn)
+    local realConvar, realWait = GetConvar, Wait
+    GetConvar = function(name, default)
+        if name == 'feather_mysql_retry_deadlocks' then return enabled and 'true' or 'false' end
+        if name == 'feather_mysql_retry_deadlocks_max' then return tostring(max) end
+        return realConvar(name, default)
+    end
+    Wait = function() end
+    local ok, failure = pcall(fn)
+    GetConvar, Wait = realConvar, realWait
+    assert(ok, failure)
+end
+check('a deadlock is retried when enabled: the whole callback runs again, and the retry commits', function()
+    withRetry(true, 3, function()
+        deadlocksRemaining = 1
+        local runs, seenIds = 0, {}
+        local committed = DB.transaction(function(tx)
+            runs = runs + 1
+            seenIds[#seenIds + 1] = tx.exec('DEADLOCK')
+            return true
+        end)
+        assert(committed == true)
+        assert(runs == 2, 'ran once, deadlocked, ran again')
+        assert(latest().closed and latest().commit, 'the retry itself committed')
+    end)
+end)
+check('deadlock retries stop at the configured maximum and the failure is raised', function()
+    withRetry(true, 2, function()
+        deadlocksRemaining = 1 / 0 -- never stops deadlocking on its own
+        local runs = 0
+        local failure = expect('DATABASE_ERROR', function()
+            DB.transaction(function(tx)
+                runs = runs + 1
+                tx.exec('DEADLOCK')
+                return true
+            end)
+        end)
+        assert(failure.driverCode == 'ER_LOCK_DEADLOCK')
+        assert(runs == 3, 'the first attempt plus 2 retries, then no more')
+        deadlocksRemaining = 0
+    end)
+end)
+check('a deadlock is not retried unless feather_mysql_retry_deadlocks is on', function()
+    deadlocksRemaining = 1
+    local runs = 0
+    local failure = expect('DATABASE_ERROR', function()
+        DB.transaction(function(tx)
+            runs = runs + 1
+            tx.exec('DEADLOCK')
+            return true
+        end)
+    end)
+    assert(failure.driverCode == 'ER_LOCK_DEADLOCK')
+    assert(runs == 1, 'off by default: one attempt, no retry')
+    deadlocksRemaining = 0
+end)
+check('a live convar above 20 is capped the same way the JS-side startup reader caps it', function()
+    withRetry(true, 21, function()
+        deadlocksRemaining = 1 / 0
+        local runs = 0
+        local failure = expect('DATABASE_ERROR', function()
+            DB.transaction(function(tx)
+                runs = runs + 1
+                tx.exec('DEADLOCK')
+                return true
+            end)
+        end)
+        assert(failure.driverCode == 'ER_LOCK_DEADLOCK')
+        assert(runs == 21, 'the first attempt plus 20 retries, capped at the same 0-20 range bridge/config.js enforces')
+        deadlocksRemaining = 0
+    end)
+end)
+check('a negative or non-numeric live convar falls back to the default instead of being unbounded or throwing', function()
+    withRetry(true, -1, function()
+        deadlocksRemaining = 1 / 0
+        local runs = 0
+        expect('DATABASE_ERROR', function()
+            DB.transaction(function(tx) runs = runs + 1; tx.exec('DEADLOCK'); return true end)
+        end)
+        assert(runs == 4, 'negative falls back to the default of 3 retries, not unbounded')
+        deadlocksRemaining = 0
+    end)
+    withRetry(true, 'not-a-number', function()
+        deadlocksRemaining = 1 / 0
+        local runs = 0
+        expect('DATABASE_ERROR', function()
+            DB.transaction(function(tx) runs = runs + 1; tx.exec('DEADLOCK'); return true end)
+        end)
+        assert(runs == 4, 'non-numeric falls back to the default of 3 retries too')
+        deadlocksRemaining = 0
+    end)
+end)
+check('a rollback whose own finish call also fails reports outcome unknown, not the original outcome', function()
+    failFinish = 'WATCHDOG_TIMEOUT'
+    local failure = expect('LUA_ERROR', function()
+        DB.transaction(function(tx)
+            tx.query('SELECT 1')
+            error('callback exploded')
+        end)
+    end)
+    failFinish = nil
+    assert(failure.outcome == 'unknown', 'the rollback was never confirmed, so LUA_ERROR\'s usual "rolled_back" outcome does not hold')
+    assert(failure.rollbackError.code == 'WATCHDOG_TIMEOUT')
+end)
+check('deadlock is not retried when finish cannot confirm rollback', function()
+    withRetry(true, 3, function()
+        deadlocksRemaining, failFinish = 1, 'WATCHDOG_TIMEOUT'
+        local runs = 0
+        local failure = expect('DATABASE_ERROR', function()
+            DB.transaction(function(tx) runs = runs + 1; tx.exec('DEADLOCK'); return true end)
+        end)
+        failFinish = nil
+        assert(runs == 1 and failure.outcome == 'unknown')
+        assert(failure.rollbackError.code == 'WATCHDOG_TIMEOUT')
+    end)
+end)
+check('provider stop and restart during backoff cancels the old transaction', function()
+    withRetry(true, 3, function()
+        deadlocksRemaining = 1
+        local runs, begins = 0, sequence
+        Wait = function()
+            state = 'stopped'
+            stopped('feather-mysql')
+            state = 'started'
+        end
+        expect('RESOURCE_STOPPED', function()
+            DB.transaction(function(tx) runs = runs + 1; tx.exec('DEADLOCK'); return true end)
+        end)
+        assert(runs == 1 and sequence == begins + 1, 'No new BEGIN after restart')
+        assert(DB.transaction(function() return true end), 'A new call works after restart')
+    end)
+end)
+check('malformed rollback success does not permit retry', function()
+    withRetry(true, 3, function()
+        deadlocksRemaining = 1
+        local runs = 0
+        local failure = expect('DATABASE_ERROR', function()
+            DB.transaction(function(tx)
+                runs = runs + 1
+                pcall(tx.exec, 'DEADLOCK')
+                malformed = response(true)
+                return true
+            end)
+        end)
+        assert(runs == 1 and failure.outcome == 'unknown')
+        assert(failure.rollbackError.code == 'BRIDGE_ERROR')
+    end)
 end)
 print(('Lua transaction contract tests: %d passed'):format(tests))

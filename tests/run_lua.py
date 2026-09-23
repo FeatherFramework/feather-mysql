@@ -34,7 +34,7 @@ try:
         checked(lua.luaL_loadfilex(state, os.fsencode(path), None))
         lua.lua_settop(state, 0)
     print(f"Lua 5.4 syntax: {len(files)} files passed", flush=True)
-    for suite in (b"tests/lua_spec.lua", b"tests/compat_spec.lua", b"tests/transaction_spec.lua", b"tests/named_spec.lua"):
+    for suite in (b"tests/lua_spec.lua", b"tests/transaction_spec.lua"):
         # Each suite gets an isolated global environment, like separate resources.
         lua.lua_close(state)
         state = lua.luaL_newstate()

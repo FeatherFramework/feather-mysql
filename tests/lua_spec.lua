@@ -13,23 +13,13 @@ local registered, handlers, logs = {}, {}, {}
 local state, caller, current = 'started', 'example-consumer', 'feather-mysql'
 local response, held, delayed, bridgeCalls = nil, nil, false, 0
 local lastRequest, failExport, resolutions = nil, false, 0
-local selfCheckAnswer, lastBatch
+local selfCheckAnswer
 local readyAnswer = function() return { ok = true, value = { ready = true } } end
-local batchAnswer = function() return { ok = true, value = true } end
 function GetConvar(_, default) return default end
 function GetInvokingResource() return caller end
 function GetCurrentResourceName() return current end
--- The provider reads its own lib/Named.lua at load.
-function LoadResourceFile(_, path)
-    local file = assert(io.open(path, 'rb'))
-    local text = file:read('*a')
-    file:close()
-    return text
-end
-local states, provides = {}, {}
+local states = {}
 function GetResourceState(name) return states[name] or state end
-function GetNumResourceMetadata(_, key) return key == 'provide' and #provides or 0 end
-function GetResourceMetadata(_, key, index) return key == 'provide' and provides[index + 1] or nil end
 local now = 123
 function GetGameTimer() return now end
 function IsDuplicityVersion() return true end
@@ -72,10 +62,6 @@ exports = setmetatable({}, {
                 elseif name == 'DriverReadyV1' then
                     local callback = ...
                     callback(readyAnswer())
-                elseif name == 'DriverTransactionBatchV1' then
-                    local owner, requests, callback = ...
-                    lastBatch = { owner = owner, requests = requests }
-                    callback(batchAnswer())
                 elseif name == 'DriverExecuteV1' then
                     bridgeCalls = bridgeCalls + 1
                     local request, callback = ...
@@ -109,7 +95,7 @@ Citizen = { Await = function(deferred)
     return deferred.value
 end }
 
-for _, name in ipairs({ 'config', 'errors', 'validation', 'results', 'logger', 'main', 'compat' }) do
+for _, name in ipairs({ 'config', 'errors', 'validation', 'results', 'logger', 'main' }) do
     dofile('server/' .. name .. '.lua')
 end
 dofile('lib/DB.lua')
@@ -476,134 +462,6 @@ check('awaitReady waits, then returns true; or false when the timeout passes fir
     assert(coroutine.resume(co))
     assert(timedOut == false and coroutine.status(co) == 'dead')
     readyAnswer = function() return { ok = true, value = { ready = true } } end
-end)
-check('oxmysql-named exports return results to a callback or to the waiting caller', function()
-    caller = 'compat-caller'
-    local names = { query = 'raw', single = 'one', scalar = 'value', insert = 'insert', update = 'exec' }
-    for export in pairs(names) do assert(type(registered[export]) == 'function', export) end
-    rows({ { z = 5 } })
-    local got
-    registered.query('SELECT z FROM t WHERE id = ?', { 9 }, function(result) got = result end)
-    assert(got and got[1].z == 5 and lastRequest.resource == 'compat-caller' and lastRequest.parameters[1].value == 9)
-    got = nil
-    assert(registered.single('SELECT z FROM t', {}).z == 5, 'Without a callback the caller waits and gets the result')
-    assert(registered.scalar('SELECT z FROM t') == 5)
-    write(42, 1)
-    assert(registered.insert('INSERT INTO t VALUES (?)', { 1 }) == 42)
-    assert(registered.update('UPDATE t SET n = 1') == 1)
-    registered.update('UPDATE t SET n = 1', nil, function(affected) got = affected end)
-    assert(got == 1)
-    write(0, 0)
-    local header = registered.query('UPDATE t SET n = 1')
-    assert(header.affectedRows == 0 and header.insertId == 0, 'A write through query returns a header')
-    caller = 'example-consumer'
-end)
--- Keep only the lines a compat export printed (the provider's own error log is captured too).
-local function lines_with(lines, text)
-    local kept = {}
-    for _, line in ipairs(lines) do if line:find(text, 1, true) then kept[#kept + 1] = line end end
-    return kept
-end
-check('oxmysql-named exports log a failure and answer nil instead of raising', function()
-    caller = 'compat-caller'
-    response = { ok = false, error = { code = 'DATABASE_ERROR', message = 'Database rejected the statement', driverCode = 'ER_DUP_ENTRY' } }
-    local got, called = 'unset', false
-    local lines = capturePrint(function()
-        assert(registered.query('INSERT INTO t VALUES (1)') == nil)
-        registered.update('INSERT INTO t VALUES (1)', {}, function(result) got, called = result, true end)
-        local ok, err = pcall(registered.query, 'SELECT ?', { {} })
-        assert(ok and err == nil, 'Invalid parameters do not raise either')
-    end)
-    assert(called and got == nil)
-    local reports = lines_with(lines, 'failed for compat-caller')
-    assert(#reports == 3, #reports)
-    assert(reports[1]:find('query failed for compat-caller', 1, true) and reports[1]:find('DATABASE_ERROR', 1, true), reports[1])
-    assert(reports[2]:find('update failed for compat-caller', 1, true))
-    assert(reports[3]:find('INVALID_ARGUMENT', 1, true), reports[3])
-    caller = 'example-consumer'
-end)
-check('the transaction export accepts the three query forms and reports true only when committed', function()
-    caller = 'compat-caller'
-    batchAnswer = function() return { ok = true, value = true } end
-    local committed = registered.transaction({
-        'UPDATE a SET n = 1',
-        { query = 'INSERT INTO b VALUES (?, ?)', values = { "O'Brien", false } },
-        { 'DELETE FROM c WHERE id = ?', { 7 } },
-    })
-    assert(committed == true and lastBatch.owner == 'compat-caller' and #lastBatch.requests == 3)
-    assert(lastBatch.requests[1].sql == 'UPDATE a SET n = 1' and lastBatch.requests[1].count == 0)
-    assert(lastBatch.requests[2].count == 2 and lastBatch.requests[2].parameters[1].value == "O'Brien" and lastBatch.requests[2].parameters[2].value == false)
-    assert(lastBatch.requests[3].parameters[1].value == 7)
-    local viaCallback
-    registered.transaction({ 'UPDATE a SET n = 2' }, function(result) viaCallback = result end)
-    assert(viaCallback == true)
-    batchAnswer = function() return { ok = false, error = { code = 'DATABASE_ERROR', message = 'Database rejected the statement' } } end
-    local before = lastBatch
-    local lines = capturePrint(function() assert(registered.transaction({ 'UPDATE a SET n = 3' }) == false) end)
-    assert(#lines_with(lines, 'transaction failed for compat-caller') == 1)
-    batchAnswer = function() return { ok = true, value = true } end
-    lastBatch = nil
-    capturePrint(function()
-        assert(registered.transaction('not a list') == false)
-        assert(registered.transaction({}) == false)
-        assert(registered.transaction({ { values = {} } }) == false)
-        assert(registered.transaction({ 'SELECT ?', { 1, 2 } }) == false, 'A parameter list where SQL belongs is not SQL')
-        assert(registered.transaction({ { 'UPDATE a SET n = ?', { {} } } }) == false, 'Invalid parameters fail before any transaction starts')
-    end)
-    assert(lastBatch == nil, 'Nothing reaches the driver for an invalid list')
-    caller = 'example-consumer'
-end)
-check('the isReady export answers a plain boolean', function()
-    readyAnswer = function() return { ok = true, value = { ready = true } } end
-    assert(registered.isReady() == true)
-    readyAnswer = function() return { ok = true, value = { ready = false } } end
-    assert(registered.isReady() == false)
-    local got
-    registered.isReady(function(ready) got = ready end)
-    assert(got == false)
-    readyAnswer = function() return { ok = true, value = { ready = true } } end
-end)
-check('the provider says when it stands in for oxmysql, and warns if a real one is also running', function()
-    selfCheckAnswer = sample
-    local function start() return capturePrint(function() handlers.onResourceStart('feather-mysql') end) end
-    provides = {}
-    assert(#start() == 1, 'Nothing extra is printed when oxmysql is not provided')
-    provides, states.oxmysql = { 'oxmysql' }, 'missing'
-    local lines = start()
-    assert(#lines == 2 and lines[2]:find('Providing "oxmysql"', 1, true), lines[2])
-    states.oxmysql = 'started'
-    lines = start()
-    assert(#lines == 2 and lines[2]:find('WARNING', 1, true) and lines[2]:find('is running', 1, true), lines[2])
-    provides, states.oxmysql = { 'something-else' }, nil
-    assert(#start() == 1)
-    provides = {}
-end)
-check('the exports accept named placeholders, and refuse a mismatch without sending anything', function()
-    caller = 'compat-caller'
-    rows({ { z = 1 } })
-    registered.query('DELETE FROM bcchousing WHERE houseid = @houseid', { houseid = 5 }, function() end)
-    assert(lastRequest.sql == 'DELETE FROM bcchousing WHERE houseid = ?' and lastRequest.count == 1 and lastRequest.parameters[1].value == 5)
-    write(0, 1)
-    assert(registered.update('UPDATE t SET a = @a WHERE id = :id AND b = @a', { a = 'x', id = 4 }) == 1)
-    assert(lastRequest.sql == 'UPDATE t SET a = ? WHERE id = ? AND b = ?' and lastRequest.count == 3)
-    assert(lastRequest.parameters[1].value == 'x' and lastRequest.parameters[2].value == 4 and lastRequest.parameters[3].value == 'x')
-    rows({ { z = 3 } })
-    assert(registered.scalar('SELECT z FROM t WHERE q = @q', { ['@q'] = false }) == 3 and lastRequest.parameters[1].value == false)
-    local before = bridgeCalls
-    local lines = capturePrint(function()
-        assert(registered.query('DELETE FROM t WHERE id = @housid', { houseid = 5 }) == nil)
-        assert(registered.update('SELECT ?', { id = 1 }) == nil)
-    end)
-    assert(bridgeCalls == before, 'Nothing reached the driver')
-    assert(#lines_with(lines, 'INVALID_ARGUMENT') == 2, table.concat(lines, ' | '))
-    batchAnswer = function() return { ok = true, value = true } end
-    lastBatch = nil
-    assert(registered.transaction({ { query = 'UPDATE t SET n = @n WHERE id = @id', values = { id = 2, n = 1 } } }) == true)
-    assert(lastBatch.requests[1].sql == 'UPDATE t SET n = ? WHERE id = ?' and lastBatch.requests[1].parameters[1].value == 1 and lastBatch.requests[1].parameters[2].value == 2)
-    lastBatch = nil
-    capturePrint(function() assert(registered.transaction({ { query = 'UPDATE t SET n = @m', values = { n = 1 } } }) == false) end)
-    assert(lastBatch == nil, 'A mismatched list never starts a transaction')
-    caller = 'example-consumer'
 end)
 check('devmode turns the log switches on by default and an explicit convar still wins', function()
     local function configWith(convars)

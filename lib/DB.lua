@@ -12,6 +12,7 @@ local WATCHDOG_MARGIN_MS = 5000
 DB = {}
 local pending, startedAt, nextId = {}, {}, 0
 local transactions = setmetatable({}, { __mode = 'k' })
+local providerGeneration = 0
 local sqlNull = { __feather_mysql_null = true }
 
 -- What a caller may assume about the database for errors raised in this file.
@@ -75,6 +76,25 @@ local WATCHDOG_MS = math.max(
     milliseconds('feather_mysql_query_timeout_ms', 30000),
     milliseconds('feather_mysql_transaction_timeout_ms', milliseconds('feather_mysql_transaction_timeout', 10000))
 ) + WATCHDOG_MARGIN_MS
+
+-- A deadlock always makes InnoDB roll back the whole transaction on its own; a lock-wait timeout
+-- does not necessarily (with the default innodb_rollback_on_timeout=0, InnoDB itself only rolls
+-- back the failed statement). Either way nothing is applied twice, because bridge/driver.js
+-- explicitly issues its own ROLLBACK for both cases before FinishTransactionV1 is even called --
+-- see transactionQuery()'s catch there. Off by default, because the callback is run again exactly
+-- as written -- it must have no side effects outside tx.* (no TriggerEvent, no writing a module-level
+-- table, nothing a second run would repeat). Read live, like feather_mysql_devmode, so it can be
+-- flipped without a restart. Bounded the same way bridge/config.js bounds the JS-side reader of the
+-- same convar (0-20), so a live convar change cannot make this unbounded even though the JS side,
+-- read only at startup, would refuse to start at all outside that range.
+local RETRYABLE_DRIVER_CODES = { ER_LOCK_DEADLOCK = true, ER_LOCK_WAIT_TIMEOUT = true }
+local MAX_RETRY_DEADLOCKS = 20
+local function retryDeadlocksLimit()
+    if GetConvar('feather_mysql_retry_deadlocks', 'false') ~= 'true' then return 0 end
+    local value = tonumber(GetConvar('feather_mysql_retry_deadlocks_max', '3'))
+    if not value or value < 0 then return 3 end
+    return math.min(math.floor(value), MAX_RETRY_DEADLOCKS)
+end
 
 -- One sweeper thread exists only while requests are outstanding, so idle
 -- consumers pay nothing and the request path allocates no timer.
@@ -143,7 +163,7 @@ local function callSite()
         local info = debug.getinfo(level, 'Sl')
         if not info then return nil end
         local source = info.source or ''
-        if info.what ~= 'C' and not source:find('lib/DB%.lua$') and not source:find('lib/MySQL%.lua$') then
+        if info.what ~= 'C' and not source:find('lib/DB%.lua$') then
             return ('%s:%d'):format((source:gsub('^@', '')), info.currentline)
         end
     end
@@ -165,8 +185,7 @@ local function warnIfInTransaction(method)
         reported[key] = true
     end
     print(('[%s] WARNING: DB.%s was called inside a DB.transaction callback in %s%s. It runs on a separate '
-        .. 'connection and is NOT part of the transaction; use tx.%s instead (with MySQL.startTransaction or '
-        .. 'MySQL.transaction, use the query function the callback receives).')
+        .. 'connection and is NOT part of the transaction; use tx.%s instead.')
         :format(PROVIDER, method, GetCurrentResourceName(), site and (' at ' .. site) or '', method))
 end
 
@@ -195,9 +214,9 @@ function DB.exec(sql, ...)
     return invoke('exec', sql, ...)
 end
 
--- For callers that cannot know the statement kind in advance: rows (an array) for a statement
--- that returns rows, otherwise the write header { affectedRows, insertId, warningStatus }.
--- Prefer the specific functions above; this is what the oxmysql compatibility layer uses.
+-- For callers that cannot know the statement kind in advance (for example generic admin tooling
+-- running an arbitrary statement): rows (an array) for a statement that returns rows, otherwise
+-- the write header { affectedRows, insertId, warningStatus }. Prefer the specific functions above.
 function DB.raw(sql, ...)
     return invoke('raw', sql, ...)
 end
@@ -232,74 +251,102 @@ function DB.transaction(callback)
     if transactions[thread] then
         raise(failure('NESTED_TRANSACTION', 'Nested DB.transaction calls are not supported'))
     end
-    local state = { closed = false }
-    transactions[thread] = state
-    local begun, transaction = pcall(callExport, 'BeginTransactionV1')
-    if not begun then
-        transactions[thread] = nil
-        raise(transaction)
-    end
-    if type(transaction) ~= 'table' or type(transaction.id) ~= 'string' then
-        transactions[thread] = nil
-        raise(failure('BRIDGE_ERROR', 'Invalid transaction response'))
-    end
-    local function query(method, sql, ...)
-        if state.closed then raise(failure('TRANSACTION_CLOSED', 'Transaction is closed')) end
-        if state.error then raise(state.error) end
-        local ok, value = pcall(callExport, 'TransactionQueryV1', transaction.id, method, sql, parameters(...))
+    local retriesLeft = retryDeadlocksLimit()
+    local generation = providerGeneration
+    for attempt = 1, math.huge do
+        if generation ~= providerGeneration then
+            transactions[thread] = nil
+            raise(failure('RESOURCE_STOPPED', 'Database resource stopped during transaction; retry cancelled'))
+        end
+        local state = { closed = false }
+        transactions[thread] = state
+        local begun, transaction = pcall(callExport, 'BeginTransactionV1')
+        if not begun then
+            transactions[thread] = nil
+            raise(transaction)
+        end
+        if type(transaction) ~= 'table' or type(transaction.id) ~= 'string' then
+            transactions[thread] = nil
+            raise(failure('BRIDGE_ERROR', 'Invalid transaction response'))
+        end
+        local function query(method, sql, ...)
+            if state.closed then raise(failure('TRANSACTION_CLOSED', 'Transaction is closed')) end
+            if state.error then raise(state.error) end
+            local ok, value = pcall(callExport, 'TransactionQueryV1', transaction.id, method, sql, parameters(...))
+            if not ok then
+                if type(value) ~= 'table' then value = failure('BRIDGE_ERROR', tostring(value)) end
+                state.error = state.error or value
+                raise(state.error)
+            end
+            return value
+        end
+        local tx = {}
+        function tx.query(sql, ...)
+            return query('query', sql, ...)
+        end
+        function tx.one(sql, ...)
+            return query('one', sql, ...)
+        end
+        function tx.value(sql, ...)
+            return query('value', sql, ...)
+        end
+        function tx.insert(sql, ...)
+            return query('insert', sql, ...)
+        end
+        function tx.exec(sql, ...)
+            return query('exec', sql, ...)
+        end
+        function tx.raw(sql, ...)
+            return query('raw', sql, ...)
+        end
+        local ok, result = pcall(callback, tx)
         if not ok then
-            if type(value) ~= 'table' then value = failure('BRIDGE_ERROR', tostring(value)) end
-            state.error = state.error or value
-            raise(state.error)
+            if type(result) == 'table' and type(result.code) == 'string' and type(result.message) == 'string' then
+                state.error = state.error or result
+            else
+                state.error = state.error or failure('LUA_ERROR', type(result) == 'string' and result or 'Transaction callback failed')
+            end
+        elseif result ~= true and result ~= false and result ~= nil then
+            state.error = state.error or failure('INVALID_ARGUMENT', 'Transaction callback must return true, false or nil')
         end
-        return value
-    end
-    local tx = {}
-    function tx.query(sql, ...)
-        return query('query', sql, ...)
-    end
-    function tx.one(sql, ...)
-        return query('one', sql, ...)
-    end
-    function tx.value(sql, ...)
-        return query('value', sql, ...)
-    end
-    function tx.insert(sql, ...)
-        return query('insert', sql, ...)
-    end
-    function tx.exec(sql, ...)
-        return query('exec', sql, ...)
-    end
-    function tx.raw(sql, ...)
-        return query('raw', sql, ...)
-    end
-    local ok, result = pcall(callback, tx)
-    if not ok then
-        if type(result) == 'table' and type(result.code) == 'string' and type(result.message) == 'string' then
-            state.error = state.error or result
+        state.closed = true
+        local commit = state.error == nil and result == true
+        local finished, value = pcall(callExport, 'FinishTransactionV1', transaction.id, commit)
+        transactions[thread] = nil
+        if state.error then
+            -- A query error can already have rolled back in the driver. Its finish reply
+            -- carries that confirmation; a missing or failed transport reply does not.
+            local rolledBack = (finished and value == false)
+                or (not finished and type(value) == 'table' and value.rollbackConfirmed == true)
+            state.error.rollbackConfirmed = rolledBack
+            if rolledBack then
+                state.error.outcome = 'rolled_back'
+            else
+                state.error.rollbackError = state.error.rollbackError or (not finished and value)
+                    or failure('BRIDGE_ERROR', 'Invalid transaction rollback response')
+                state.error.outcome = 'unknown'
+            end
+            if rolledBack and generation == providerGeneration and retriesLeft > 0
+                and RETRYABLE_DRIVER_CODES[state.error.driverCode] then
+                retriesLeft = retriesLeft - 1
+                transactions[thread] = state
+                Wait(math.random(20, 40) * attempt)
+            else
+                raise(state.error)
+            end
         else
-            state.error = state.error or failure('LUA_ERROR', type(result) == 'string' and result or 'Transaction callback failed')
+            if not finished then raise(value) end
+            if type(value) ~= 'boolean' or value ~= commit then
+                raise(failure('BRIDGE_ERROR', 'Invalid transaction completion response'))
+            end
+            return value
         end
-    elseif result ~= true and result ~= false and result ~= nil then
-        state.error = state.error or failure('INVALID_ARGUMENT', 'Transaction callback must return true, false or nil')
     end
-    state.closed = true
-    local commit = state.error == nil and result == true
-    local finished, value = pcall(callExport, 'FinishTransactionV1', transaction.id, commit)
-    transactions[thread] = nil
-    if state.error then
-        if not finished then state.error.rollbackError = value end
-        raise(state.error)
-    end
-    if not finished then raise(value) end
-    if type(value) ~= 'boolean' or value ~= commit then
-        raise(failure('BRIDGE_ERROR', 'Invalid transaction completion response'))
-    end
-    return value
 end
 
 AddEventHandler('onResourceStop', function(resource)
     if resource ~= PROVIDER then return end
+    providerGeneration = providerGeneration + 1
     for _, state in pairs(transactions) do
         state.error = state.error or failure('RESOURCE_STOPPED', 'Database resource stopped; write outcome may be unknown')
     end

@@ -9,7 +9,7 @@ const root = path.resolve(__dirname, '..');
 const turn = () => new Promise(resolve => setImmediate(resolve));
 
 function runtime({ missingDriver = false, failQuery = false, convars = {}, mysql = null } = {}) {
-    const exported = {}, events = {}, commands = {}, scheduled = [], calls = [], logs = [], errors = [], probes = [];
+    const exported = {}, events = {}, commands = {}, scheduled = [], calls = [], logs = [], errors = [], probes = [], monitors = [];
     let settings;
     let caller = 'feather-mysql';
     class FakeDriver {
@@ -26,10 +26,11 @@ function runtime({ missingDriver = false, failQuery = false, convars = {}, mysql
         }
         finish(...args) { calls.push(['finish', ...args]); return Promise.resolve(args[2]); }
         abortOwner(...args) { calls.push(['abortOwner', ...args]); }
-        batch(...args) { calls.push(['batch', ...args]); return Promise.resolve(true); }
         readiness() { return { ready: true, code: null }; }
         // The probe is reported through `probes`, not `calls`, so the exact-call assertions stay simple.
         awaitDatabase(report) { probes.push(report); return Promise.resolve(true); }
+        // Started after awaitDatabase() succeeds; never resolves on its own, like the real one.
+        monitor(report) { monitors.push(report); return new Promise(() => {}); }
         diagnostics() { return { activeRequests: 1, acquiring: 0, checkedOut: 2, transactions: 1 }; }
         close() { calls.push('closed'); return Promise.resolve(); }
     }
@@ -52,7 +53,7 @@ function runtime({ missingDriver = false, failQuery = false, convars = {}, mysql
         },
     };
     vm.runInNewContext(fs.readFileSync(path.join(root, 'bridge/index.js'), 'utf8'), context);
-    return { exported, events, commands, calls, scheduled, logs, errors, probes, settings, setCaller: name => { caller = name; } };
+    return { exported, events, commands, calls, scheduled, logs, errors, probes, monitors, settings, setCaller: name => { caller = name; } };
 }
 
 test('bridge binds NULL/false parameters and defers Lua callback to main-thread scheduling', async () => {
@@ -85,11 +86,10 @@ test('other resources cannot bypass the Lua dispatcher, and are told so instead 
     exported.DriverTransactionFinishV1('forged-owner', 'transaction-1', true, record);
     exported.DriverSelfCheckV1(record);
     exported.DriverReadyV1(record);
-    exported.DriverTransactionBatchV1('forged-owner', [{ sql: 'SELECT 1', count: 0, parameters: [] }], record);
     await turn();
     while (scheduled.length) scheduled.shift()();
     assert.equal(calls.length, 0, 'No driver call is made for an unauthorized caller');
-    assert.equal(answers.length, 7, 'Every request is answered; none is silently dropped');
+    assert.equal(answers.length, 6, 'Every request is answered; none is silently dropped');
     for (const answer of answers) {
         assert.equal(answer.ok, false);
         assert.equal(answer.error.code, 'INVALID_CALLER');
@@ -238,12 +238,21 @@ test('the _ms transaction convar wins and the new limits get sensible defaults',
     assert.equal(settings.options.maxTransactionsPerOwner, 5, 'Half of the default pool of 10');
     assert.equal(settings.options.cleanupTimeoutMs, 5000);
     assert.equal(typeof settings.options.killQuery, 'function');
+    assert.equal(settings.options.retryDeadlocks, false, 'Off by default');
+    assert.equal(settings.options.retryDeadlocksMax, 3);
     assert.deepEqual({ ...settings.options.sessionOptions }, { database: 'game', charset: 'utf8mb4' },
         'Cleanup restores the configured database and charset');
     const configured = runtime({ convars: { feather_mysql_max_transactions_per_resource: '0', mysql_connection_string: 'mysql://u@h/db?connectionLimit=4' } });
     assert.equal(configured.settings.options.maxTransactionsPerOwner, Infinity, '0 removes the limit');
     const small = runtime({ convars: { mysql_connection_string: 'mysql://u@h/db?connectionLimit=1' } });
     assert.equal(small.settings.options.maxTransactionsPerOwner, 1, 'Never below one');
+});
+test('deadlock retry is opt-in and its limit is configurable', () => {
+    const on = runtime({ convars: { feather_mysql_retry_deadlocks: 'true', feather_mysql_retry_deadlocks_max: '7' } });
+    assert.equal(on.settings.options.retryDeadlocks, true);
+    assert.equal(on.settings.options.retryDeadlocksMax, 7);
+    const bad = runtime({ convars: { feather_mysql_retry_deadlocks_max: '-1' } });
+    assert.match(bad.errors[0], /retry_deadlocks_max/);
 });
 
 test('slow transactions are logged without enabling transaction logging', () => {
@@ -273,8 +282,8 @@ test('the startup self-check answers with the value shapes a result carries, wit
     assert.equal(result.value.first, row.text);
 });
 
-test('the database is probed once at start and the result is reported without secrets', () => {
-    const { probes, logs, errors } = runtime();
+test('the database is probed once at start and the result is reported without secrets', async () => {
+    const { probes, monitors, logs, errors } = runtime();
     assert.equal(probes.length, 1, 'One probe loop starts with the driver');
     probes[0](false, 'ECONNREFUSED', 1);
     probes[0](true, null, 3);
@@ -282,27 +291,25 @@ test('the database is probed once at start and the result is reported without se
     assert.match(logs.at(-1), /Database reachable after 3 attempts\./);
     probes[0](true, null, 1);
     assert.match(logs.at(-1), /Database reachable\.$/);
-    assert.equal(runtime({ missingDriver: true }).probes.length, 0, 'Nothing is probed without a driver');
+    await turn();
+    assert.equal(monitors.length, 1, 'Periodic monitoring starts once startup succeeds, so a later outage is not missed');
+    monitors[0](false, 'PROTOCOL_CONNECTION_LOST');
+    assert.match(logs.at(-1), /Database unreachable \(PROTOCOL_CONNECTION_LOST\)\./);
+    monitors[0](true, null);
+    assert.match(logs.at(-1), /Database reachable again\./);
+    const { probes: missingProbes, monitors: missingMonitors } = runtime({ missingDriver: true });
+    assert.equal(missingProbes.length, 0, 'Nothing is probed without a driver');
+    await turn();
+    assert.equal(missingMonitors.length, 0, 'Nothing is monitored without a driver');
 });
 
-test('readiness and batch transactions are routed for this resource only', async () => {
-    const { exported, calls, scheduled } = runtime();
-    let ready, committed;
+test('readiness is routed to the driver and the value shape reaches the caller', async () => {
+    const { exported, scheduled } = runtime();
+    let ready;
     exported.DriverReadyV1(response => { ready = response; });
-    exported.DriverTransactionBatchV1('consumer-a', [
-        { sql: 'INSERT INTO t VALUES (?, ?)', count: 2, parameters: [{ value: "O'Brien" }, { isNull: true }] },
-        { sql: 'UPDATE t SET n = 1', count: 0, parameters: [] },
-    ], response => { committed = response; });
     await turn();
     while (scheduled.length) scheduled.shift()();
     assert.deepEqual({ ...ready.value }, { ready: true, code: null });
-    assert.equal(committed.value, true);
-    const batch = calls.find(call => call[0] === 'batch');
-    assert.equal(batch[1], 'consumer-a');
-    assert.equal(batch[2].length, 2);
-    assert.deepEqual(Array.from(batch[2], statement => statement.sql), ['INSERT INTO t VALUES (?, ?)', 'UPDATE t SET n = 1']);
-    assert.deepEqual(Array.from(batch[2][0].parameters), ["O'Brien", null]);
-    assert.deepEqual(Array.from(batch[2][1].parameters), []);
 });
 
 test('configuration errors print only static, credential-free text', () => {

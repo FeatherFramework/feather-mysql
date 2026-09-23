@@ -219,27 +219,7 @@ test('isolated MariaDB integration', async t => {
             await db.finish('polite', other.id, false);
             await zero(db); await db.close();
         });
-        await t.test('a batch commits every statement together, or none of them', async () => {
-            await seed(); const db = factory(2);
-            assert.equal(await db.batch('consumer', [
-                { sql: 'UPDATE records SET value = ? WHERE id = ?', parameters: [111, 1] },
-                { sql: 'INSERT INTO records (id, value, sample) VALUES (?, ?, ?)', parameters: [30, 3, "O'Brien"] },
-                { sql: 'DELETE FROM records WHERE id = ?', parameters: [2] },
-            ]), true);
-            assert.equal(await scalar(db, 'SELECT value FROM records WHERE id = 1'), 111);
-            assert.equal(await scalar(db, 'SELECT sample FROM records WHERE id = 30'), "O'Brien");
-            assert.equal(await scalar(db, 'SELECT COUNT(*) FROM records WHERE id = 2'), 0);
-            await seed();
-            await assert.rejects(db.batch('consumer', [
-                { sql: 'UPDATE records SET value = 555 WHERE id = 1', parameters: [] },
-                { sql: 'INSERT INTO records (id, value) VALUES (2, 1)', parameters: [] },
-                { sql: 'UPDATE records SET value = 777 WHERE id = 2', parameters: [] },
-            ]), { code: 'ER_DUP_ENTRY' });
-            assert.equal(await scalar(db, 'SELECT value FROM records WHERE id = 1'), 100, 'The first update was rolled back');
-            assert.equal(await scalar(db, 'SELECT value FROM records WHERE id = 2'), 100, 'Nothing after the failure ran');
-            await zero(db); await db.close();
-        });
-        await t.test('the SQL patterns the Feather resources use work through transactions and batches', async () => {
+        await t.test('the SQL patterns the Feather resources use work through transactions', async () => {
             await admin.query(`CREATE TABLE ${database}.receipts (source_resource VARCHAR(40) NOT NULL, request_id VARCHAR(40) NOT NULL,
                 request_fingerprint VARCHAR(64) NOT NULL, result_json TEXT NULL, PRIMARY KEY (source_resource, request_id)) ENGINE=InnoDB`);
             await admin.query(`CREATE TABLE ${database}.grants (assignment_id CHAR(36) PRIMARY KEY, role_id INT NOT NULL, revision INT NOT NULL) ENGINE=InnoDB`);
@@ -260,25 +240,33 @@ test('isolated MariaDB integration', async t => {
             assert.equal(one.fingerprint, 'fp');
             assert.strictEqual(one.total, 1, 'COUNT(*) AS `count` is a number');
             assert.equal((await query(db, 'SELECT UUID() AS `id`')).rows[0].id.length, 36);
-            assert.equal(await db.batch('roles', [
+            // The native equivalent of a fixed statement list, one connection for the whole thing:
+            // what a Lua DB.transaction loop (or an exported statement-list transaction, when that
+            // still existed) actually does underneath.
+            const runAsTransaction = async (owner, statements) => {
+                const tx = await db.begin(owner);
+                for (const { sql, parameters } of statements) await db.transactionQuery(owner, tx.id, sql, parameters);
+                return db.finish(owner, tx.id, true);
+            };
+            assert.equal(await runAsTransaction('roles', [
                 { sql: 'INSERT INTO grants (assignment_id, role_id, revision) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE role_id = VALUES(role_id), revision = VALUES(revision)', parameters: ['a-1', 1, 1] },
                 { sql: 'INSERT INTO grants (assignment_id, role_id, revision) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE role_id = VALUES(role_id), revision = VALUES(revision)', parameters: ['a-1', 9, 2] },
             ]), true);
             const grant = (await query(db, 'SELECT role_id, revision FROM grants WHERE assignment_id = ?', ['a-1'])).rows[0];
             assert.deepEqual({ ...grant }, { role_id: 9, revision: 2 });
             const sets = [['o', 1.5, 2.5, 0], ['o', 3.5, 4.5, 0], ['o', 1.5, 2.5, 0]];
-            assert.equal(await db.batch('cartography', sets.map(parameters => ({
+            assert.equal(await runAsTransaction('cartography', sets.map(parameters => ({
                 sql: 'INSERT IGNORE INTO `cartography_discoveries` (`owner_key`, `x`, `y`, `z`) VALUES (?, ?, ?, ?)', parameters }))), true);
             assert.strictEqual(await scalar(db, 'SELECT COUNT(*) FROM cartography_discoveries'), 2, 'The duplicate set was ignored');
             await zero(db); await db.close();
         });
         await t.test('the start-up probe reaches a real database and reports a missing one without hanging', async () => {
             const reachable = factory(2);
-            assert.deepEqual(reachable.readiness(), { ready: false, code: null });
+            assert.deepEqual(reachable.readiness(), { ready: false, code: null, health: 'starting' });
             const reports = [];
             assert.equal(await reachable.awaitDatabase((ready, code, attempt) => reports.push([ready, code, attempt])), true);
             assert.deepEqual(reports, [[true, null, 1]]);
-            assert.deepEqual(reachable.readiness(), { ready: true, code: null });
+            assert.deepEqual(reachable.readiness(), { ready: true, code: null, health: 'connected' });
             await zero(reachable); await reachable.close();
             const missing = factory(1, 3000, 5000, { socketPath: path.join(directory, 'no-such.sock') });
             const seen = [];
@@ -393,7 +381,11 @@ test('isolated MariaDB integration', async t => {
             assert.equal(results.filter(r => r.status === 'rejected').length, 1);
             const loser = results.findIndex(r => r.status === 'rejected');
             assert.equal(results[loser].reason.code, 'ER_LOCK_DEADLOCK');
+            assert.equal(results[loser].reason.outcome, 'rolled_back');
+            assert.equal(results[loser].reason.rollbackConfirmed, true);
             const owners = ['a', 'b'], handles = [a, b];
+            await assert.rejects(db.finish(owners[loser], handles[loser].id, false),
+                { code: 'ER_LOCK_DEADLOCK', rollbackConfirmed: true, outcome: 'rolled_back' });
             await db.finish(owners[1 - loser], handles[1 - loser].id, true);
             assert.equal(await scalar(db, 'SELECT SUM(value) FROM records'), '202');
             await zero(db); await db.close();

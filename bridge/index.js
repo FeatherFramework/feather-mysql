@@ -51,6 +51,10 @@ try {
     const devMode = GetConvar('feather_mysql_devmode', 'false') === 'true';
     const logTransactions = GetConvar('feather_mysql_log_transactions', String(devMode)) === 'true';
     errorDetail = GetConvar('feather_mysql_error_detail', 'false') === 'true';
+    // Off by default: retrying replays the statement (or, for a Lua DB.transaction, the whole
+    // callback) as-is, which is only safe when the caller has no side effects outside the database.
+    const retryDeadlocks = GetConvar('feather_mysql_retry_deadlocks', 'false') === 'true';
+    const retryDeadlocksMax = integer(GetConvar('feather_mysql_retry_deadlocks_max', '3'), 3, 0, 20, 'feather_mysql_retry_deadlocks_max');
     driver = new Driver(mysql.createPool(config), timeout, transactionTimeout, entry => {
         const finished = entry.event === 'COMMIT' || entry.event === 'ROLLBACK' || entry.event === 'ABORT';
         const slow = finished && slowMs > 0 && entry.durationMs >= slowMs;
@@ -62,14 +66,22 @@ try {
         cleanupTimeoutMs: cleanupTimeout,
         killQuery: threadId => killQuery(mysql, config, threadId),
         sessionOptions: { database: config.database, charset: config.charset },
+        retryDeadlocks, retryDeadlocksMax,
     });
     console.log(`${tag} Driver configured (pool ${config.connectionLimit}, queue ${config.queueLimit}).`);
     if (devMode) console.log(`${tag} Devmode is on: logging every query and transaction. Turn it off for production.`);
     // Reach the database once at start (retrying while it is down) so readiness
-    // is known, and report it once instead of on the first unlucky query.
+    // is known, and report it once instead of on the first unlucky query. Once reachable, keep
+    // probing periodically for the life of the driver -- otherwise readiness()/healthState()
+    // would only ever reflect this first connection, never a later outage or recovery.
     driver.awaitDatabase((ready, code, attempt) => {
         if (ready) console.log(`${tag} Database reachable${attempt > 1 ? ` after ${attempt} attempts` : ''}.`);
         else console.error(`${tag} Database not reachable yet (${code}); retrying.`);
+    }).then(ready => {
+        if (!ready) return;
+        driver.monitor((nowReady, code) => {
+            console.log(nowReady ? `${tag} Database reachable again.` : `${tag} Database unreachable (${code}).`);
+        }).catch(() => {});
     }).catch(() => {});
 } catch (error) {
     console.error(`${tag} CONFIG_ERROR: ${error instanceof ConfigError
@@ -121,9 +133,6 @@ exports('DriverTransactionQueryV1', (owner, id, request, callback) => {
 });
 exports('DriverTransactionFinishV1', (owner, id, commit, callback) => {
     dispatch(callback, db => db.finish(owner, id, commit));
-});
-exports('DriverTransactionBatchV1', (owner, requests, callback) => {
-    dispatch(callback, db => db.batch(owner, Array.from(requests, request => ({ sql: request.sql, parameters: parameters(request) }))));
 });
 exports('DriverReadyV1', callback => {
     dispatch(callback, db => db.readiness());

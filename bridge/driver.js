@@ -11,6 +11,13 @@ function fault(code, outcome) {
 // ER_PARSE_ERROR and ER_UNSUPPORTED_PS. Both are raised while the server is preparing a statement,
 // before anything runs, so trying again another way cannot apply a write twice.
 const PREPARE_REFUSED = new Set([1064, 1295]);
+// Standalone statements retry only after session cleanup. Transaction callbacks are retried
+// by the Lua library after a confirmed ROLLBACK: a lock-wait timeout alone does not guarantee
+// that the whole transaction was rolled back. Jitter reduces repeated lock collisions.
+const RETRYABLE_LOCK_CODES = new Set(['ER_LOCK_DEADLOCK', 'ER_LOCK_WAIT_TIMEOUT']);
+function retryDelayMs(attempt) {
+    return Math.min(200, (attempt + 1) * 20) + Math.floor(Math.random() * 20);
+}
 // Client-side escaping backslashes quotes, which is not sound when the connection character set
 // can swallow the backslash as part of a multibyte character.
 const MULTIBYTE_CHARSETS = /^(gbk|gb2312|gb18030|big5|sjis|cp932|euckr|eucjpms|ujis)/i;
@@ -30,6 +37,31 @@ function firstValue(rows) {
     const row = rows?.[0];
     return Array.isArray(row) ? row[0] : Object.values(row ?? {})[0];
 }
+
+// Bounded recent-sample percentiles for one phase (acquiring a connection, running a statement,
+// or resetting a session for reuse). A fixed-size ring buffer, not a proper streaming quantile
+// estimator -- enough to answer "is this slow right now", not for long-term trend analysis.
+class Latencies {
+    constructor(capacity = 200) {
+        this.capacity = capacity;
+        this.samples = [];
+        this.next = 0;
+    }
+    record(ms) {
+        if (this.samples.length < this.capacity) this.samples.push(ms);
+        else { this.samples[this.next] = ms; this.next = (this.next + 1) % this.capacity; }
+    }
+    percentile(p) {
+        if (this.samples.length === 0) return null;
+        const sorted = [...this.samples].sort((a, b) => a - b);
+        return sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
+    }
+    summary() {
+        return { count: this.samples.length, p50: this.percentile(0.5), p95: this.percentile(0.95), p99: this.percentile(0.99) };
+    }
+}
+// How many of the most recent completed run() calls decide "degraded" (see healthState).
+const RECENT_OUTCOMES_CAPACITY = 50;
 
 // One lease owns one physical connection until protocol cleanup is complete.
 class ConnectionLease {
@@ -129,6 +161,9 @@ class Driver {
     //   cleanupTimeoutMs         deadline for session cleanup after an answer was sent
     //   killQuery(threadId)      best-effort cancellation of a statement on the server
     //   sessionOptions           { database, charset } restored by every session cleanup
+    //   retryDeadlocks           retry a standalone statement or batch() once InnoDB reports
+    //                            ER_LOCK_DEADLOCK/ER_LOCK_WAIT_TIMEOUT (default off)
+    //   retryDeadlocksMax        attempts on top of the first (default 3)
     constructor(pool, timeoutMs, transactionTimeoutMs = 10000, onTransaction = () => {}, options = {}) {
         this.pool = pool;
         this.timeoutMs = timeoutMs;
@@ -144,31 +179,62 @@ class Driver {
         this.maxTransactionsPerOwner = options.maxTransactionsPerOwner ?? Infinity;
         this.cleanupTimeoutMs = options.cleanupTimeoutMs ?? 5000;
         this.killQuery = options.killQuery ?? null;
+        this.retryDeadlocks = options.retryDeadlocks ?? false;
+        this.retryDeadlocksMax = options.retryDeadlocksMax ?? 3;
         // Copied so a later change to the caller's object cannot alter cleanup.
         this.sessionOptions = { ...(options.sessionOptions ?? {}) };
         this.instance = randomUUID();
         this.sequence = 0;
         this.cleanupFailures = 0;
         this.resetFailures = 0;
-        this.totals = { queries: 0, errors: 0, timeouts: 0, poolExhausted: 0, killRequests: 0, maxAcquireMs: 0, textFallbacks: 0 };
-        this.database = { ready: false, code: null };
+        this.totals = { queries: 0, errors: 0, timeouts: 0, poolExhausted: 0, killRequests: 0, maxAcquireMs: 0, textFallbacks: 0, deadlockRetries: 0 };
+        this.database = { ready: false, code: null, everReady: false };
+        this.latencies = { acquire: new Latencies(), execute: new Latencies(), cleanup: new Latencies() };
+        // Outcome (true/false) of each recently completed caller request (not the internal health
+        // probe), oldest overwritten first. See healthState().
+        this.recentOutcomes = [];
         this.readyTimer = null;
         this.wakeReady = null;
         this.closing = null;
     }
     // "Ready" means a probe has reached the database since start. Probing begins
     // only when the bridge asks for it, so a driver that is never probed (or is
-    // built by a test) opens no connection.
-    readiness() { return { ready: this.database.ready, code: this.database.code }; }
+    // built by a test) opens no connection. `health` is the coarser status in
+    // healthState(); `ready` stays a plain boolean for existing callers.
+    readiness() { return { ready: this.database.ready, code: this.database.code, health: this.healthState() }; }
+    recordOutcome(ok) {
+        this.recentOutcomes.push(ok);
+        if (this.recentOutcomes.length > RECENT_OUTCOMES_CAPACITY) this.recentOutcomes.shift();
+    }
+    // starting: the database has never been reached since this driver started. unavailable: it was
+    // reached before and cannot be reached right now. degraded: reachable, but a meaningful share of
+    // recent caller requests (not the health probe itself) have failed. connected: none of those.
+    healthState() {
+        if (!this.database.ready) return this.database.everReady ? 'unavailable' : 'starting';
+        const total = this.recentOutcomes.length;
+        if (total >= 5) {
+            const failures = this.recentOutcomes.filter(ok => !ok).length;
+            if (failures / total > 0.2) return 'degraded';
+        }
+        return 'connected';
+    }
     async probe() {
         try {
             await this.run('SELECT 1', [], 'health');
-            this.database.ready = true; this.database.code = null;
+            this.database.ready = true; this.database.code = null; this.database.everReady = true;
         } catch (error) {
             this.database.ready = false;
             this.database.code = typeof error?.code === 'string' ? error.code : 'DATABASE_ERROR';
         }
         return this.database.ready;
+    }
+    // Interruptible sleep shared by the startup and monitor loops below: close() wakes it at once
+    // instead of leaving it to run out its interval.
+    sleep(ms) {
+        return new Promise(resolve => {
+            this.wakeReady = resolve;
+            this.readyTimer = setTimeout(resolve, ms);
+        });
     }
     // Probe until the database answers: one second apart, doubling up to ten.
     // report(ready, code, attempt) is called on the first failure, every tenth
@@ -177,12 +243,23 @@ class Driver {
         for (let attempt = 1; !this.stopped; attempt++) {
             if (await this.probe()) { report(true, null, attempt); return true; }
             if (attempt === 1 || attempt % 10 === 0) report(false, this.database.code, attempt);
-            await new Promise(resolve => {
-                this.wakeReady = resolve;
-                this.readyTimer = setTimeout(resolve, Math.min(10000, 1000 * 2 ** Math.min(attempt - 1, 4)));
-            });
+            await this.sleep(Math.min(10000, 1000 * 2 ** Math.min(attempt - 1, 4)));
         }
         return false;
+    }
+    // Keeps probing after the database first becomes reachable, so a later outage or recovery is
+    // reflected in readiness()/healthState() -- not just in the failure ratio of real caller
+    // traffic, which healthState() only ever raises to "degraded", and which can be slow to
+    // accumulate for a low-traffic resource. Call once awaitDatabase() succeeds; runs for the
+    // life of the driver. report(ready, code) is called only when reachability actually changes.
+    async monitor(report = () => {}, intervalMs = 5000) {
+        while (!this.stopped) {
+            await this.sleep(intervalMs);
+            if (this.stopped) return;
+            const wasReady = this.database.ready;
+            const nowReady = await this.probe();
+            if (nowReady !== wasReady) report(nowReady, this.database.code);
+        }
     }
     async acquire() {
         this.acquiring++;
@@ -191,6 +268,7 @@ class Driver {
             const connection = await this.pool.getConnection();
             const waited = Date.now() - started;
             if (waited > this.totals.maxAcquireMs) this.totals.maxAcquireMs = waited;
+            this.latencies.acquire.record(waited);
             const lease = new ConnectionLease(connection, () => this.leases.delete(lease), this.sessionOptions);
             lease.onTextFallback = () => { this.totals.textFallbacks++; };
             this.leases.add(lease);
@@ -223,11 +301,13 @@ class Driver {
     cleanup(lease) {
         const work = (async () => {
             let timer;
+            const started = Date.now();
             try {
                 await Promise.race([
                     lease.reset(),
                     new Promise((_, reject) => { timer = setTimeout(() => reject(fault('CLEANUP_TIMEOUT')), this.cleanupTimeoutMs); }),
                 ]);
+                this.latencies.cleanup.record(Date.now() - started);
                 lease.release();
             } catch (_) {
                 this.resetFailures++;
@@ -251,6 +331,9 @@ class Driver {
                 settled = true;
                 clearTimeout(timer);
                 this.active.delete(operation);
+                // The health probe measures the database, not a caller; it must not count toward
+                // the caller-traffic error rate healthState() uses to decide "degraded".
+                if (owner !== 'health') this.recordOutcome(!error);
                 if (error) { this.totals.errors++; reject(error); } else resolve(result);
             };
             const cancel = code => {
@@ -262,37 +345,55 @@ class Driver {
             const timer = setTimeout(() => cancel('QUERY_TIMEOUT'), this.timeoutMs);
             this.active.add(operation);
             (async () => {
-                try {
-                    lease = await this.acquire();
-                    // Acquisition can complete after cancellation. Never execute then.
-                    if (settled) {
-                        if (this.stopped) this.destroy(lease); else lease.release();
-                        return;
-                    }
-                    let value;
+                // One iteration per attempt. With retryDeadlocks off, attempt 0 always finishes the
+                // loop (canRetry is always false), so behavior is identical to before this existed.
+                for (let attempt = 0; ; attempt++) {
                     try {
-                        const [rows, fields] = await lease.execute(sql, parameters);
-                        value = normalize(rows, fields);
-                    } catch (error) {
-                        // A cancelled operation already destroyed its lease.
+                        lease = await this.acquire();
+                        // Acquisition can complete after cancellation. Never execute then.
+                        if (settled) {
+                            if (this.stopped) this.destroy(lease); else lease.release();
+                            return;
+                        }
+                        let value, executeTimed = false;
+                        const executeStarted = Date.now();
+                        try {
+                            const [rows, fields] = await lease.execute(sql, parameters);
+                            this.latencies.execute.record(Date.now() - executeStarted);
+                            executeTimed = true;
+                            value = normalize(rows, fields);
+                        } catch (error) {
+                            if (!executeTimed) this.latencies.execute.record(Date.now() - executeStarted);
+                            // A cancelled operation already destroyed its lease.
+                            if (settled) return;
+                            // The server answered with a statement error, or the result shape was
+                            // unsupported: the session is intact once reset. Anything else (transport,
+                            // protocol) leaves it uncertain.
+                            if (isStatementError(error) || error.code === 'RESULT_TYPE') await this.cleanup(lease);
+                            else this.destroy(lease);
+                            const canRetry = this.retryDeadlocks && attempt < this.retryDeadlocksMax
+                                && RETRYABLE_LOCK_CODES.has(error?.code);
+                            if (canRetry) {
+                                this.totals.deadlockRetries++;
+                                await new Promise(resolve => setTimeout(resolve, retryDelayMs(attempt)));
+                                if (settled) return;
+                                continue;
+                            }
+                            finish(error);
+                            return;
+                        }
                         if (settled) return;
-                        finish(error);
-                        // The server answered with a statement error, or the result
-                        // shape was unsupported: the session is intact once reset.
-                        // Anything else (transport, protocol) leaves it uncertain.
-                        if (isStatementError(error) || error.code === 'RESULT_TYPE') await this.cleanup(lease);
-                        else this.destroy(lease);
+                        // Answer first: session cleanup must not delay the caller, nor
+                        // turn an applied statement into a reported failure.
+                        finish(null, value);
+                        await this.cleanup(lease);
                         return;
+                    } catch (error) {
+                        finish(error);
+                        return;
+                    } finally {
+                        if (lease && !lease.closed) this.destroy(lease);
                     }
-                    if (settled) return;
-                    // Answer first: session cleanup must not delay the caller, nor
-                    // turn an applied statement into a reported failure.
-                    finish(null, value);
-                    await this.cleanup(lease);
-                } catch (error) {
-                    finish(error);
-                } finally {
-                    if (lease && !lease.closed) this.destroy(lease);
                 }
             })();
         });
@@ -399,12 +500,21 @@ class Driver {
         try {
             await this.race(tx, tx.lease.command(commit ? 'COMMIT' : 'ROLLBACK'));
         } catch (error) {
+            if (originalError) {
+                originalError.outcome = 'unknown';
+                originalError.rollbackConfirmed = false;
+                originalError.rollbackError = error;
+            }
             this.abort(tx, originalError || error);
             throw originalError || error;
         }
         // The statement is acknowledged, so the outcome is decided. Session
         // cleanup can no longer change what the caller is told.
         const lease = tx.lease;
+        if (originalError) {
+            originalError.outcome = 'rolled_back';
+            originalError.rollbackConfirmed = true;
+        }
         this.retire(tx, originalError);
         this.logTransaction(tx, commit ? 'COMMIT' : 'ROLLBACK', originalError);
         this.cleanup(lease);
@@ -418,19 +528,6 @@ class Driver {
         }
         return this.complete(tx, commit === true);
     }
-    // A fixed list of statements as one transaction: commit when every statement
-    // succeeded, otherwise roll back and raise the first failure.
-    async batch(owner, statements) {
-        const tx = await this.begin(owner);
-        try {
-            for (const statement of statements) await this.transactionQuery(owner, tx.id, statement.sql, statement.parameters);
-        } catch (error) {
-            // A failed statement already rolled back; anything else must not leave the transaction open.
-            if (this.transactions.has(tx.id)) await this.finish(owner, tx.id, false).catch(() => {});
-            throw error;
-        }
-        return this.finish(owner, tx.id, true);
-    }
     abortOwner(owner) {
         for (const operation of [...this.active]) if (operation.owner === owner) operation.cancel('RESOURCE_STOPPED');
         for (const tx of [...this.transactions.values()]) if (tx.owner === owner) this.abort(tx, fault('RESOURCE_STOPPED', 'unknown'));
@@ -440,9 +537,13 @@ class Driver {
         return { stopped: this.stopped, activeRequests: this.active.size, acquiring: this.acquiring,
             checkedOut: this.leases.size, cleaning: this.cleanups.size, transactions: this.transactions.size,
             cleanupFailures: this.cleanupFailures, resetFailures: this.resetFailures, totals: { ...this.totals },
-            ready: this.database.ready, readyCode: this.database.code,
+            ready: this.database.ready, readyCode: this.database.code, health: this.healthState(),
             poolConnections: pool?._allConnections?.length ?? null,
             poolFree: pool?._freeConnections?.length ?? null, poolQueued: pool?._connectionQueue?.length ?? null,
+            // Milliseconds. acquire: waiting for a free connection. execute: the statement on the
+            // server. cleanup: changeUser() after an answer was already sent (see cleanup()).
+            latencies: { acquireMs: this.latencies.acquire.summary(), executeMs: this.latencies.execute.summary(),
+                cleanupMs: this.latencies.cleanup.summary() },
             transactionDetails: [...this.transactions.values()].map(tx => ({ id: tx.id, resource: tx.owner,
                 phase: tx.phase, durationMs: Date.now() - tx.started, queries: tx.queries })) };
     }
@@ -460,4 +561,4 @@ class Driver {
     }
 }
 
-module.exports = { Driver, ConnectionLease, normalize };
+module.exports = { Driver, ConnectionLease, normalize, Latencies };

@@ -29,7 +29,7 @@ Rules:
 
 ## 2. Where you may call it
 
-Every `DB.*` call waits for the database by yielding the current coroutine. Event handlers, `RegisterCommand` handlers, `CreateThread` bodies and your own exported functions all run as coroutines in Cfx, so they work. Code at the top level of a script file does not:
+Queries, transactions and `DB.awaitReady` wait by yielding the current coroutine; `DB.isReady()` is a synchronous readiness check. Event handlers, `RegisterCommand` handlers, `CreateThread` bodies and your own exported functions all run as coroutines in Cfx, so they work. Code at the top level of a script file does not:
 
 ```lua
 -- WRONG: top level of the file, not yieldable. Raises INVALID_CONTEXT.
@@ -117,8 +117,8 @@ end)
 
 | SQL | Lua |
 | --- | --- |
-| `INT`, `BIGINT` within 2^53, `COUNT(*)` | number |
-| `BIGINT` beyond 2^53 | string (exact) |
+| `INT`, `BIGINT` within ±(2^53−1), `COUNT(*)` | number |
+| `BIGINT` outside that range | string (exact) |
 | `DECIMAL`, and `SUM()` of integers | string (exact, never rounded) |
 | `FLOAT`, `DOUBLE` | number |
 | dates, times, JSON | string |
@@ -313,45 +313,7 @@ end)
 
 Return plain values and short reason strings across resources rather than raw error tables, and validate every argument: an export can be called by any server resource.
 
-## 8. Existing oxmysql-style code
-
-If the real oxmysql is no longer on disk, resources that import `@oxmysql/lib/MySQL.lua` keep working once this resource provides `oxmysql` (README, "Replacing oxmysql"). You can also point a resource at the adapter directly:
-
-```lua
--- fxmanifest.lua
-dependency 'feather-mysql'
-server_scripts { '@feather-mysql/lib/MySQL.lua', 'server.lua' }
-```
-
-```lua
-MySQL.query('SELECT id FROM users WHERE active = ?', { true }, function(rows, err)
-    if err then print(err) return end
-    print(#rows)
-end)
-
-local user = MySQL.single.await('SELECT id, name FROM users WHERE id = ?', { 42 })
-local header = MySQL.query.await('UPDATE users SET name = ? WHERE id = ?', { 'New', 42 })   -- header.affectedRows
-
--- Commits unless the callback returns false (oxmysql's rule):
-local committed = MySQL.startTransaction(function(query)
-    query('INSERT INTO log (msg) VALUES (?)', { 'hello' })
-    local rows = query('SELECT COUNT(*) AS n FROM log FOR UPDATE')
-    return rows[1].n < 100      -- false rolls back
-end)
-
-local ok = MySQL.transaction.await({
-    { query = 'UPDATE a SET n = n - ? WHERE id = ?', values = { 5, 1 } },
-    { query = 'UPDATE a SET n = n + ? WHERE id = ?', values = { 5, 2 } },
-})
-
-MySQL.ready(function() print('database is reachable') end)
-```
-
-Supported: `query`, `single`, `scalar`, `insert`, `update`, `prepare`, `transaction` (callback and `.await`), `startTransaction`, `ready`, `isReady`, `awaitConnection`. Not supported (raises `UNSUPPORTED_API`): `rawExecute`, `Sync`/`Async` aliases and anything else. Named placeholders (`:name`, `@name`) are not supported.
-
-For new code, prefer `DB.transaction`: there, returning nothing rolls back, which is the safer default.
-
-## 9. Common mistakes
+## 8. Common mistakes
 
 | Mistake | What happens | Fix |
 | --- | --- | --- |
@@ -365,8 +327,8 @@ For new code, prefer `DB.transaction`: there, returning nothing rolls back, whic
 | Reading `source` after the first `DB` call | Wrong player | `local src = source` first |
 | Not catching errors in a player event | The event's coroutine dies with a table error | `pcall` and log |
 
-## 10. Checking that it works
+## 9. Checking that it works
 
 - On start the provider prints `Bridge self-check OK.` If it prints `FAILED`, database calls will not work and the message says why.
 - `feather_mysql_diagnostics` (server console) prints pool, queue, transaction and counter state.
-- The console test resource `feather-mysql-test` runs every API against a disposable database: `ensure feather-mysql-test`, then `feather_mysql_test`.
+- The optional companion resource `feather-mysql-test` exercises the API against your configured database; use a dedicated test database: `ensure feather-mysql-test`, then `feather_mysql_test`.

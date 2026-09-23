@@ -5,10 +5,11 @@ const { Driver, ConnectionLease, normalize } = require('../bridge/driver');
 const { parseConnectionString, connectionOptions, ConfigError } = require('../bridge/config');
 const { publicError, isStatementError } = require('../bridge/errors');
 
-function fixture(execute = async () => [[{ answer: 42 }], [{ name: 'answer' }]]) {
+function fixture(execute = async () => [[{ answer: 42 }], [{ name: 'answer' }]], driverOptions = {}) {
     const calls = { acquired: 0, released: 0, destroyed: 0, reset: 0, ended: 0, executions: [] };
     const connection = {
         execute: async (...args) => { calls.executions.push(args); return execute(...args); },
+        query: async sql => { calls.executions.push([sql]); return [[{ ok: 1 }]]; },
         threadId: 77,
         // The lease cleans a session with changeUser({}); calls.reset counts those.
         changeUser: async options => { calls.sessionOptions = options; calls.reset++; },
@@ -18,9 +19,46 @@ function fixture(execute = async () => [[{ answer: 42 }], [{ name: 'answer' }]])
         getConnection: async () => { calls.acquired++; return connection; },
         end: async () => { calls.ended++; },
     };
-    return { driver: new Driver(pool, 1000), pool, calls, connection };
+    return { driver: new Driver(pool, 1000, 10000, undefined, driverOptions), pool, calls, connection };
 }
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+test('SQL failure and its finish tombstone preserve acknowledged rollback', async () => {
+    const cause = lockError();
+    const { driver } = fixture(async () => { throw cause; });
+    const tx = await driver.begin('owner');
+    await assert.rejects(driver.transactionQuery('owner', tx.id, 'UPDATE X', []), error => {
+        const safe = publicError(error);
+        assert.equal(safe.outcome, 'rolled_back');
+        assert.equal(safe.rollbackConfirmed, true);
+        assert.equal(safe.driverCode, 'ER_LOCK_DEADLOCK');
+        return true;
+    });
+    await assert.rejects(driver.finish('owner', tx.id, false), error => error === cause && error.rollbackConfirmed === true);
+    await driver.close();
+});
+test('failed rollback retains the SQL cause and sanitized rollback error', async () => {
+    const cause = lockError();
+    const { driver, connection, calls } = fixture(async () => { throw cause; });
+    const tx = await driver.begin('owner');
+    connection.query = async () => { throw Object.assign(new Error('secret SQL password'), { code: 'ECONNRESET' }); };
+    await assert.rejects(driver.transactionQuery('owner', tx.id, 'UPDATE X', []), error => {
+        const safe = publicError(error);
+        assert.equal(safe.outcome, 'unknown');
+        assert.equal(safe.rollbackConfirmed, false);
+        assert.equal(safe.driverCode, 'ER_LOCK_DEADLOCK');
+        assert.equal(safe.rollbackError.driverCode, 'ECONNRESET');
+        assert.doesNotMatch(JSON.stringify(safe), /secret|password/);
+        return true;
+    });
+    await assert.rejects(driver.finish('owner', tx.id, false), error => error === cause && error.rollbackConfirmed === false);
+    assert.equal(calls.destroyed, 1);
+    await driver.close();
+});
+// Real errno/sqlState so isStatementError classifies these as safe-to-reuse, like the server would.
+function lockError(code = 'ER_LOCK_DEADLOCK') {
+    return Object.assign(new Error('Deadlock found when trying to get lock; try restarting transaction'),
+        { code, errno: code === 'ER_LOCK_DEADLOCK' ? 1213 : 1205, sqlState: code === 'ER_LOCK_DEADLOCK' ? '40001' : 'HY000' });
+}
 
 test('URI configuration decodes credentials and locks unsafe options', () => {
     const config = parseConnectionString('mysql://test:p%40ss%3Bword@localhost:3307/game?connectionLimit=4&ssl=true');
@@ -325,4 +363,47 @@ test('a retry that runs inside a transaction uses the transaction connection', a
     assert.deepEqual(statementsRun(calls).map(([sql]) => sql), ['START TRANSACTION', 'SHOW COLUMNS FROM t LIKE ?']);
     await driver.finish('owner', tx.id, true);
     await driver.drain();
+});
+
+test('a deadlock is retried when enabled: the failed connection is reused, not discarded', async () => {
+    let seen = 0;
+    const { driver, calls } = fixture(async () => {
+        seen++;
+        if (seen < 3) throw lockError();
+        return [[{ answer: 42 }], [{ name: 'answer' }]];
+    }, { retryDeadlocks: true, retryDeadlocksMax: 5 });
+    assert.equal((await driver.run('SELECT ? AS answer', [1])).first, 42);
+    await driver.drain();
+    assert.equal(calls.acquired, 3, 'two failed attempts, then one that succeeded');
+    assert.equal(calls.destroyed, 0, 'a deadlock leaves the session intact; every attempt is reset and reused');
+    assert.equal(calls.reset, 3);
+    assert.equal(calls.released, 3);
+    assert.equal(driver.diagnostics().totals.deadlockRetries, 2);
+});
+test('ER_LOCK_WAIT_TIMEOUT is retried the same way as ER_LOCK_DEADLOCK', async () => {
+    let seen = 0;
+    const { driver } = fixture(async () => {
+        seen++;
+        if (seen < 2) throw lockError('ER_LOCK_WAIT_TIMEOUT');
+        return [[{ answer: 42 }], [{ name: 'answer' }]];
+    }, { retryDeadlocks: true });
+    assert.equal((await driver.run('SELECT ?', [1])).first, 42);
+});
+test('deadlock retries stop at the configured maximum and the original error surfaces', async () => {
+    const { driver, calls } = fixture(async () => { throw lockError(); }, { retryDeadlocks: true, retryDeadlocksMax: 2 });
+    await assert.rejects(driver.run('SELECT ?', [1]), { code: 'ER_LOCK_DEADLOCK' });
+    assert.equal(calls.acquired, 3, 'the first attempt plus 2 retries, then no more');
+    assert.equal(driver.diagnostics().totals.deadlockRetries, 2);
+});
+test('a deadlock is not retried unless feather_mysql_retry_deadlocks is on', async () => {
+    const { driver, calls } = fixture(async () => { throw lockError(); });
+    await assert.rejects(driver.run('SELECT ?', [1]), { code: 'ER_LOCK_DEADLOCK' });
+    assert.equal(calls.acquired, 1, 'off by default: one attempt, no retry');
+    assert.equal(driver.diagnostics().totals.deadlockRetries, 0);
+});
+test('retrying is specific to the two lock error codes, not statement errors generally', async () => {
+    const { driver, calls } = fixture(async () => { throw Object.assign(new Error('dup'),
+        { code: 'ER_DUP_ENTRY', errno: 1062, sqlState: '23000' }); }, { retryDeadlocks: true, retryDeadlocksMax: 5 });
+    await assert.rejects(driver.run('INSERT INTO t VALUES (1)', []), { code: 'ER_DUP_ENTRY' });
+    assert.equal(calls.acquired, 1);
 });
