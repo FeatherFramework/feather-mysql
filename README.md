@@ -190,7 +190,25 @@ Supported, each with a callback form and `.await`: `query`, `single`, `scalar`, 
 - Anything else raises `UNSUPPORTED_API`.
 - Errors from the adapter's `.await` calls are raised as text, as they are by the library it replaces: `[feather-mysql] DATABASE_ERROR: Database rejected the statement (method=query driverCode=ER_PARSE_ERROR ...)` followed by the stack trace of your call. A callback receives the error table instead.
 
-The same calls are available as exports for other resources: `exports['feather-mysql']:query(sql, params, cb)`, and likewise `single`, `scalar`, `insert`, `update`, `transaction` and `isReady`. Failures are printed and answered with `nil` (`false` for `transaction` and `isReady`) instead of raising. Without a callback the call waits for the result inside your coroutine; with one it returns at once. `query` returns rows for a read and a header (`affectedRows`, `insertId`) for a write, and `update` returns the affected-row count as a number.
+The same calls are available as exports, for a resource that would rather not import the Lua file:
+
+### Public service contracts
+
+```lua
+exports['feather-mysql']:query(sql, parameters?, callback?)
+exports['feather-mysql']:single(sql, parameters?, callback?)
+exports['feather-mysql']:scalar(sql, parameters?, callback?)
+exports['feather-mysql']:insert(sql, parameters?, callback?)
+exports['feather-mysql']:update(sql, parameters?, callback?)
+
+exports['feather-mysql']:transaction(queries, callback?)
+
+exports['feather-mysql']:isReady(callback?)
+```
+
+Failures are printed and answered with `nil` (`false` for `transaction` and `isReady`) instead of raising. Without a callback the call waits for the result inside your coroutine; with one it returns at once. `query` returns rows for a read and a header (`affectedRows`, `insertId`) for a write, and `update` returns the affected-row count as a number.
+
+This is the whole public contract. `ExecuteV1`, `ReadyV1`, `BeginTransactionV1`, `TransactionQueryV1` and `FinishTransactionV1` are also reachable through `exports['feather-mysql']`, but they are the internal protocol `lib/DB.lua` and `lib/MySQL.lua` use to talk to this resource, not a stable API: call the functions above, or import one of those two files, instead of calling those directly.
 
 ## Diagnostics
 
