@@ -1,0 +1,156 @@
+'use strict';
+
+// Only this file knows about Cfx. Required modules are ordinary Node modules.
+const resource = GetCurrentResourceName();
+const root = GetResourcePath(resource);
+const tag = `[${resource}]`;
+const { parseConnectionString, connectionOptions, integer, ConfigError } = require(`${root}/bridge/config.js`);
+const { Driver } = require(`${root}/bridge/driver.js`);
+const { publicError } = require(`${root}/bridge/errors.js`);
+
+// Side connections used to cancel abandoned statements are bounded so a database
+// that is already struggling is not also flooded with kill attempts.
+const MAX_CONCURRENT_KILLS = 2;
+const KILL_CONNECT_TIMEOUT_MS = 2000;
+
+let driver;
+let errorDetail = false;
+let activeKills = 0;
+
+// Closing the client socket does not stop a statement that is already running,
+// so a timed-out UPDATE could still be applied afterwards. KILL QUERY interrupts
+// it. The user may always kill their own threads; failure is tolerated.
+async function killQuery(mysql, config, threadId) {
+    if (!Number.isSafeInteger(threadId) || threadId < 1 || activeKills >= MAX_CONCURRENT_KILLS) return;
+    activeKills++;
+    let connection;
+    try {
+        connection = await mysql.createConnection({ ...connectionOptions(config), connectTimeout: KILL_CONNECT_TIMEOUT_MS });
+        await connection.query(`KILL QUERY ${threadId}`);
+    } catch (_) { /* Best effort: the client side is already cancelled. */ }
+    finally {
+        activeKills--;
+        try { connection?.destroy(); } catch (_) { /* nothing left to release */ }
+    }
+}
+
+try {
+    const mysql = require(`${root}/node_modules/mysql2/promise`);
+    const config = parseConnectionString(GetConvar('mysql_connection_string', ''));
+    const timeout = integer(GetConvar('feather_mysql_query_timeout_ms', '30000'), 30000, 1, 300000, 'feather_mysql_query_timeout_ms');
+    // The _ms name is canonical; the older unsuffixed convar is still honoured.
+    const transactionTimeout = integer(
+        GetConvar('feather_mysql_transaction_timeout_ms', '') || GetConvar('feather_mysql_transaction_timeout', '10000'),
+        10000, 1, 300000, 'feather_mysql_transaction_timeout_ms');
+    const cleanupTimeout = integer(GetConvar('feather_mysql_cleanup_timeout_ms', '5000'), 5000, 1, 60000, 'feather_mysql_cleanup_timeout_ms');
+    const slowMs = integer(GetConvar('feather_mysql_slow_query_ms', '200'), 200, 0, 3600000, 'feather_mysql_slow_query_ms');
+    // 0 removes the per-resource limit; by default one resource may use at most
+    // half of the pool for transactions, which hold a connection while Lua runs.
+    const transactionCap = integer(GetConvar('feather_mysql_max_transactions_per_resource', ''),
+        Math.max(1, Math.floor(config.connectionLimit / 2)), 0, 1000, 'feather_mysql_max_transactions_per_resource');
+    const devMode = GetConvar('feather_mysql_devmode', 'false') === 'true';
+    const logTransactions = GetConvar('feather_mysql_log_transactions', String(devMode)) === 'true';
+    errorDetail = GetConvar('feather_mysql_error_detail', 'false') === 'true';
+    driver = new Driver(mysql.createPool(config), timeout, transactionTimeout, entry => {
+        const finished = entry.event === 'COMMIT' || entry.event === 'ROLLBACK' || entry.event === 'ABORT';
+        const slow = finished && slowMs > 0 && entry.durationMs >= slowMs;
+        if (logTransactions || entry.code || slow) {
+            setImmediate(() => console.log(`${tag} TX ${JSON.stringify(slow ? { ...entry, slow: true } : entry)}`));
+        }
+    }, {
+        maxTransactionsPerOwner: transactionCap || Infinity,
+        cleanupTimeoutMs: cleanupTimeout,
+        killQuery: threadId => killQuery(mysql, config, threadId),
+        sessionOptions: { database: config.database, charset: config.charset },
+    });
+    console.log(`${tag} Driver configured (pool ${config.connectionLimit}, queue ${config.queueLimit}).`);
+    if (devMode) console.log(`${tag} Devmode is on: logging every query and transaction. Turn it off for production.`);
+    // Reach the database once at start (retrying while it is down) so readiness
+    // is known, and report it once instead of on the first unlucky query.
+    driver.awaitDatabase((ready, code, attempt) => {
+        if (ready) console.log(`${tag} Database reachable${attempt > 1 ? ` after ${attempt} attempts` : ''}.`);
+        else console.error(`${tag} Database not reachable yet (${code}); retrying.`);
+    }).catch(() => {});
+} catch (error) {
+    console.error(`${tag} CONFIG_ERROR: ${error instanceof ConfigError
+        ? error.message : 'check mysql_connection_string and the npm ci installation'}`);
+}
+
+// Runs `work`, then hands the outcome to the Lua callback on a later turn so the
+// function reference is invoked from the Cfx main thread.
+function answer(callback, work) {
+    const deliver = response => setImmediate(() => {
+        try { callback(response); }
+        catch (_) { console.error(`${tag} Lua response callback unavailable.`); }
+    });
+    try {
+        Promise.resolve(work()).then(
+            value => deliver({ ok: true, value }),
+            error => deliver({ ok: false, error: publicError(error, { detail: errorDetail }) }),
+        );
+    } catch (error) { deliver({ ok: false, error: publicError(error, { detail: errorDetail }) }); }
+}
+
+// Internal exports: consumers must go through Lua validation and attribution.
+// A refused caller is answered rather than ignored, so a legitimate caller can
+// never end up waiting forever on a request that was silently dropped.
+function dispatch(callback, operation) {
+    if (typeof callback !== 'function') return;
+    if (GetInvokingResource() !== resource) return answer(callback, () => Promise.reject({ code: 'INVALID_CALLER' }));
+    if (!driver) return answer(callback, () => Promise.reject({ code: 'CONFIG_ERROR' }));
+    answer(callback, () => operation(driver));
+}
+
+function parameters(request) {
+    const values = [];
+    for (let i = 0; i < request.count; i++) {
+        const parameter = request.parameters[i];
+        values.push(parameter.isNull === true ? null : parameter.value);
+    }
+    return values;
+}
+
+exports('DriverExecuteV1', (request, callback) => {
+    dispatch(callback, db => db.run(request.sql, parameters(request), request.resource || resource));
+});
+exports('DriverTransactionBeginV1', (owner, callback) => {
+    dispatch(callback, db => db.begin(owner));
+});
+exports('DriverTransactionQueryV1', (owner, id, request, callback) => {
+    dispatch(callback, db => db.transactionQuery(owner, id, request.sql, parameters(request)));
+});
+exports('DriverTransactionFinishV1', (owner, id, commit, callback) => {
+    dispatch(callback, db => db.finish(owner, id, commit));
+});
+exports('DriverTransactionBatchV1', (owner, requests, callback) => {
+    dispatch(callback, db => db.batch(owner, Array.from(requests, request => ({ sql: request.sql, parameters: parameters(request) }))));
+});
+exports('DriverReadyV1', callback => {
+    dispatch(callback, db => db.readiness());
+});
+
+// Startup self-check (no database needed): returns the value shapes a query
+// result contains so Lua can confirm the Cfx boundary carries them intact and
+// that the caller identity assumption holds.
+exports('DriverSelfCheckV1', callback => {
+    if (typeof callback !== 'function') return;
+    if (GetInvokingResource() !== resource) return answer(callback, () => Promise.reject({ code: 'INVALID_CALLER' }));
+    answer(callback, () => {
+        const row = Object.create(null);
+        row.text = 'héllo \u{1F600} 日本語';
+        row.number = 42; row.nothing = null; row.bytes = [0, 255]; row.big = '9007199254740993'; row.flag = false;
+        return { kind: 'rows', rows: [row], firstColumn: 'text', first: row.text };
+    });
+});
+
+// One command per provider name, so two providers can coexist on a server.
+RegisterCommand(`${resource.replace(/[^A-Za-z0-9]+/g, '_')}_diagnostics`, source => {
+    if (source !== 0) return;
+    console.log(`${tag} ${JSON.stringify(driver ? driver.diagnostics() : { code: 'CONFIG_ERROR' })}`);
+}, true);
+
+on('onResourceStop', name => {
+    if (!driver) return;
+    if (name === resource) driver.close().catch(() => console.error(`${tag} Pool shutdown failed.`));
+    else driver.abortOwner(name);
+});
