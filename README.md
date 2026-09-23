@@ -1,4 +1,4 @@
-# feather-mysql
+# Feather MySQL
 
 A small, dependable MySQL/MariaDB layer for FiveM and RedM servers. You write plain Lua, it talks to the database.
 
@@ -214,3 +214,7 @@ The companion `feather-mysql-test` resource adds console checks that run on a re
 - Binary values cannot be sent as parameters; binary results arrive as arrays of bytes.
 - Tested on RedM with MariaDB 11.8. FiveM, MySQL 8 and TLS have not been tested.
 - Caching, a public prepared-statement API and automatic retries are not included.
+
+## License
+
+GPL v3. See [LICENSE](LICENSE).
