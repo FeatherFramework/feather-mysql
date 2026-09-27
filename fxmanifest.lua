@@ -6,7 +6,7 @@ lua54 'yes'
 author 'Feather Framework'
 description 'Standalone Lua database API with a minimal mysql2 transport'
 name 'feather-mysql'
-version '0.1.2'
+version '0.2.0'
 node_version '22'
 
 -- Deliberately not server_only: a resource that declares dependency 'feather-mysql' has that

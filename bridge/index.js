@@ -43,7 +43,10 @@ try {
         GetConvar('feather_mysql_transaction_timeout_ms', '') || GetConvar('feather_mysql_transaction_timeout', '10000'),
         10000, 1, 300000, 'feather_mysql_transaction_timeout_ms');
     const cleanupTimeout = integer(GetConvar('feather_mysql_cleanup_timeout_ms', '5000'), 5000, 1, 60000, 'feather_mysql_cleanup_timeout_ms');
-    const slowMs = integer(GetConvar('feather_mysql_slow_query_ms', '200'), 200, 0, 3600000, 'feather_mysql_slow_query_ms');
+    // Transaction duration includes every statement and time spent in the Lua callback.
+    // Give it its own warning threshold instead of applying the single-query threshold.
+    const slowTransactionMs = integer(GetConvar('feather_mysql_slow_transaction_ms', '1000'),
+        1000, 0, 3600000, 'feather_mysql_slow_transaction_ms');
     // 0 removes the per-resource limit; by default one resource may use at most
     // half of the pool for transactions, which hold a connection while Lua runs.
     const transactionCap = integer(GetConvar('feather_mysql_max_transactions_per_resource', ''),
@@ -57,7 +60,7 @@ try {
     const retryDeadlocksMax = integer(GetConvar('feather_mysql_retry_deadlocks_max', '3'), 3, 0, 20, 'feather_mysql_retry_deadlocks_max');
     driver = new Driver(mysql.createPool(config), timeout, transactionTimeout, entry => {
         const finished = entry.event === 'COMMIT' || entry.event === 'ROLLBACK' || entry.event === 'ABORT';
-        const slow = finished && slowMs > 0 && entry.durationMs >= slowMs;
+        const slow = finished && slowTransactionMs > 0 && entry.durationMs >= slowTransactionMs;
         if (logTransactions || entry.code || slow) {
             setImmediate(() => console.log(`${tag} TX ${JSON.stringify(slow ? { ...entry, slow: true } : entry)}`));
         }
