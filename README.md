@@ -1,7 +1,5 @@
 # Feather MySQL
 
-**0.1.0 — Initial release**
-
 A standalone MySQL/MariaDB resource for FiveM and RedM. Use plain Lua `DB.*` calls backed by a pooled mysql2 transport.
 
 ```lua
@@ -117,6 +115,23 @@ end)
 - Set `feather_mysql_retry_deadlocks true` to enable bounded retries for deadlocks and lock-wait timeouts. It is off by default. Transactions retry only after rollback is confirmed, using a fresh connection lease and `BEGIN`. A provider stop cancels pending retries.
 - A retry runs the **whole callback again**. Use this option only when callbacks have no side effects outside `tx.*`, such as events or changes to shared Lua tables. The same switch also retries standalone statements. `feather_mysql_retry_deadlocks_max` (default `3`, range `0–20`) counts retries after the first attempt.
 
+### Declarative batches
+
+For several independent statements that must all succeed or all roll back together, where no statement's result feeds into another, `DB.batchTransaction` avoids writing a callback:
+
+```lua
+local results = DB.batchTransaction({
+    DB.stmt('INSERT INTO accounts (owner, balance) VALUES (?, ?)', ownerId, 0),
+    DB.stmt('UPDATE accounts SET balance = balance + ? WHERE owner = ?', amount, otherOwnerId),
+})
+```
+
+- Build each statement with `DB.stmt(sql, ...)`, not a bare `{sql, ...}` table - a plain table constructor cannot reliably keep a `nil` parameter in the middle or at the end, `DB.stmt` can.
+- All statements run atomically on the same connection, in order, inside one transaction; a `SELECT` later in the array sees the array's own earlier, not-yet-committed writes.
+- Returns one result per statement, each shaped like `DB.raw`'s: rows for a statement that returns rows, otherwise `{ affectedRows, insertId, warningStatus }`.
+- Any statement failing rolls back the whole batch and raises, the same as `DB.transaction`.
+- If a later statement needs a value produced by an earlier one (such as an insert ID), use `DB.transaction` directly instead - a batch has no way to pass data between its statements.
+
 ## Errors
 
 Failures are raised as a table, so use `pcall`. Printing the table gives a readable report with the place in your code. An error you do not catch is shown by the server only as `error object is not a string`, with no reason and no place, so wrap `DB.*` calls in `pcall` wherever a failure is possible.
@@ -164,7 +179,8 @@ Optional convars are read at startup. Lua transaction retry settings and Lua dev
 | `feather_mysql_retry_deadlocks` | `false` | `true` automatically retries a standalone statement, or a whole `DB.transaction` callback, once the database reports a deadlock or a lock-wait timeout |
 | `feather_mysql_retry_deadlocks_max` | `3` | Retries on top of the first attempt, when the above is on. Bounded to 0-20 |
 | `feather_mysql_devmode` | `false` | `true` turns on every log below by default (queries, transactions, SQL text) and reports each misused call every time. An explicit setting of any of them still wins. Leave it off in production |
-| `feather_mysql_slow_query_ms` | `200` | Log queries and transactions at or above this; `0` disables |
+| `feather_mysql_slow_query_ms` | `200` | Log individual requests at or above this; `0` disables slow-request logging |
+| `feather_mysql_slow_transaction_ms` | `1000` | Log completed transactions at or above this, including all statements and Lua callback time; `0` disables slow-transaction logging. Errors still log |
 | `feather_mysql_log_queries` | `false` | Log every request (metadata only) |
 | `feather_mysql_log_transactions` | `false` | Log every transaction event |
 | `feather_mysql_log_sql` | `false` | Include the SQL text in logs |

@@ -344,6 +344,41 @@ function DB.transaction(callback)
     end
 end
 
+--- Builds one statement for DB.batchTransaction. Needed instead of a bare {sql, ...} table because
+--- a Lua table constructor cannot reliably keep a nil parameter in the middle or at the end (the #
+--- operator is undefined over holes); calling this as a real function reuses the same select('#', ...)
+--- handling every other DB.* call gets, via parameters(...).
+function DB.stmt(sql, ...)
+    if type(sql) ~= 'string' then
+        raise(failure('INVALID_ARGUMENT', 'DB.stmt requires a SQL string'))
+    end
+    return { sql = sql, params = parameters(...) }
+end
+
+--- Runs an array of DB.stmt(...) statements atomically without a callback, for the common case of
+--- several independent statements that must all succeed or all roll back together and where one
+--- statement's result does not feed into another (that case still needs DB.transaction directly).
+--- Returns one result per statement, each shaped like DB.raw's: rows for a statement that returns
+--- rows, otherwise { affectedRows, insertId, warningStatus }.
+function DB.batchTransaction(statements)
+    if type(statements) ~= 'table' or #statements == 0 then
+        raise(failure('INVALID_ARGUMENT', 'DB.batchTransaction requires a non-empty array built with DB.stmt(...)'))
+    end
+    for i, statement in ipairs(statements) do
+        if type(statement) ~= 'table' or type(statement.sql) ~= 'string' or type(statement.params) ~= 'table' then
+            raise(failure('INVALID_ARGUMENT', ('DB.batchTransaction statement %d was not built with DB.stmt(...)'):format(i)))
+        end
+    end
+    local results = {}
+    DB.transaction(function(tx)
+        for i, statement in ipairs(statements) do
+            results[i] = tx.raw(statement.sql, table.unpack(statement.params, 1, #statement.params))
+        end
+        return true
+    end)
+    return results
+end
+
 AddEventHandler('onResourceStop', function(resource)
     if resource ~= PROVIDER then return end
     providerGeneration = providerGeneration + 1
