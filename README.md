@@ -228,3 +228,60 @@ The companion `feather-mysql-test` resource adds console checks that run on a re
 ## License
 
 GPL v3. See [LICENSE](LICENSE).
+
+
+### Read-only CFX scheduling comparison
+
+Server console: `feather_mysql_bridge_probe` (no arguments). Runs three samples
+per fixed mode: inline synchronous export callback, setImmediate, promise
+then setImmediate, tick queue, and promise then tick queue. Reports Lua round-trip
+and JS-local promise/queue durations.
+It does not issue SQL or change normal database response delivery. Player callers,
+extra arguments and overlapping commands are refused; samples time out after five
+seconds. Inline is a diagnostic only, not a replacement for safe delivery after I/O.
+
+See the authoritative [latency investigation](../feather-framework-docs/feather-mysql/FEATHER_MYSQL_LATENCY_INVESTIGATION.md).
+Controlled live probe: inline 0 ms, setImmediate median 61 ms, promise-plus-setImmediate median 64 ms (promise stage 0 ms). This is diagnostic evidence, not a production scheduling fix. Deploy existing bridge/index.js
+and server/main.lua together and use a full server restart for this shared resource;
+no consumer DB.lua or manifest change is required.
+
+The tick comparison is diagnostic-only: at most 16 pending completions, eight per
+tick, snapshot batches, no ticker while idle, and queued work discarded on stop.
+Normal query response scheduling remains unchanged. Live tick comparison showed no convincing repeatable gain (tick median 65 ms;
+existing immediate path 57 ms in that run). Asynchronous-I/O completion-context
+acceptance remains pending; synchronous inline
+success does not establish safety for database I/O callbacks.
+
+
+### Independent statements inside a transaction: tx.batch
+
+`tx.batch({ DB.stmt(sql, ...), ... })` runs 1–32 already-known independent
+statements on the existing transaction connection in one Lua/JS bridge call.
+It returns one `DB.raw`-shaped result per statement. Inspect those results in the
+callback and return true to commit, or false to roll back. Statements inside a
+batch cannot depend on an earlier result; use normal tx methods for that case.
+
+```
+DB.transaction(function(tx)
+    local results = tx.batch({
+        DB.stmt('SELECT event_id FROM example_events WHERE horse_id=?', horseId),
+        DB.stmt('SELECT generation_id FROM example_slots WHERE character_id=?', characterId)
+    })
+    -- Validate both results before deciding whether this transaction may commit.
+    return validateResults(results)
+end)
+```
+
+Every statement is validated before execution. Inputs are dense DB.stmt arrays,
+limited to 32 statements, 128 KiB SQL and 1024 total parameters. SQL NULL, false
+and raw result shapes retain existing semantics. A failed statement stops the
+batch and taints/rolls back the enclosing transaction even if caught in Lua.
+Ownership, deadline, stop, rollback confirmation and outer retry rules remain.
+A batch reserves the connection against interleaving queries/finish operations.
+Existing DB.batchTransaction remains its Lua convenience loop and is unchanged.
+
+This additive API requires lib/DB.lua, server/validation.lua, server/main.lua,
+bridge/index.js and bridge/driver.js together. Consumer libraries reload on a
+full server restart. Controlled live read batching passed: three separate transaction queries totaled
+314 ms versus 196 ms with tx.batch in one paired sample. Broader failure/write/
+concurrency and latency-distribution acceptance remain pending.

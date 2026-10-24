@@ -480,6 +480,29 @@ test('isolated MariaDB integration', async t => {
             await zero(db); await db.close();
             admin.destroy(); admin = await mysql.createConnection({ socketPath, user: 'root' });
         });
+        await t.test('batched statements retain connection affinity and allow validation before commit', async () => {
+            await seed(); const db=factory(); const tx=await db.begin('batch');
+            const values=await db.transactionBatch('batch',tx.id,[
+                {sql:'SELECT CONNECTION_ID() AS id',parameters:[]},
+                {sql:'UPDATE records SET value=? WHERE id=1',parameters:[777]},
+                {sql:'SELECT CONNECTION_ID() AS id',parameters:[]}
+            ]);
+            assert.equal(values[0].first,values[2].first);
+            assert.equal(values[1].header.affectedRows,1);
+            await db.finish('batch',tx.id,false);
+            assert.equal(await scalar(db,'SELECT value FROM records WHERE id=1'),100);
+            await zero(db); await db.close();
+        });
+        await t.test('batched SQL failure rolls prior writes back and stops later statements', async () => {
+            await seed(); const db=factory(); const tx=await db.begin('batch');
+            await assert.rejects(db.transactionBatch('batch',tx.id,[
+                {sql:'UPDATE records SET value=777 WHERE id=1',parameters:[]},
+                {sql:'SELECT * FROM missing_batch_table',parameters:[]},
+                {sql:'UPDATE records SET value=999 WHERE id=1',parameters:[]}
+            ]),e=>e.rollbackConfirmed===true && e.outcome==='rolled_back');
+            assert.equal(await scalar(db,'SELECT value FROM records WHERE id=1'),100);
+            await zero(db); await db.close();
+        });
         // Driver counters alone are insufficient evidence: check actual server sessions.
         await delay(200);
         const processes = (await admin.query('SHOW PROCESSLIST'))[0];

@@ -469,9 +469,9 @@ class Driver {
             return { id: tx.id };
         } catch (error) { this.abort(tx, error); throw error; }
     }
-    async transactionQuery(owner, id, sql, parameters) {
+    async transactionQuery(owner, id, sql, parameters, batchToken) {
         const tx = this.transaction(owner, id);
-        if (tx.busy || tx.phase !== 'active') {
+        if (tx.busy || tx.phase !== 'active' || (tx.batchToken && tx.batchToken !== batchToken)) {
             const error = fault('TRANSACTION_BUSY', 'not_executed'); this.abort(tx, error); throw error;
         }
         tx.busy = true;
@@ -488,6 +488,29 @@ class Driver {
             throw tx.failure || error;
         } finally {
             if (tx.active && tx.phase === 'query') { tx.busy = false; tx.phase = 'active'; }
+        }
+    }
+    async transactionBatch(owner, id, statements) {
+        if (!Array.isArray(statements) || statements.length < 1 || statements.length > 32
+            || statements.some(s => !s || typeof s.sql !== 'string' || !Array.isArray(s.parameters))) {
+            throw fault('INVALID_ARGUMENT', 'not_executed');
+        }
+        const tx = this.transaction(owner, id);
+        if (tx.busy || tx.phase !== 'active' || tx.batchToken) {
+            const error = fault('TRANSACTION_BUSY', 'not_executed'); this.abort(tx, error); throw error;
+        }
+        // Reserve across awaits and between statements. Ordinary query/finish
+        // cannot interleave while one batch owns this same retained connection.
+        const token = {};
+        tx.batchToken = token;
+        try {
+            const results = [];
+            for (const statement of statements) {
+                results.push(await this.transactionQuery(owner, id, statement.sql, statement.parameters, token));
+            }
+            return results;
+        } finally {
+            if (tx.batchToken === token) delete tx.batchToken;
         }
     }
     // COMMIT or ROLLBACK, then hand the connection to background cleanup. The
@@ -523,7 +546,7 @@ class Driver {
     }
     async finish(owner, id, commit) {
         const tx = this.transaction(owner, id);
-        if (tx.busy || tx.phase !== 'active') {
+        if (tx.busy || tx.phase !== 'active' || tx.batchToken) {
             const error = fault('TRANSACTION_BUSY', 'not_executed'); this.abort(tx, error); throw error;
         }
         return this.complete(tx, commit === true);

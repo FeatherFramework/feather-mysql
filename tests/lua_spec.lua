@@ -9,12 +9,14 @@ local function check(name, fn)
     print('PASS ' .. name)
 end
 
-local registered, handlers, logs = {}, {}, {}
+local registered, handlers, logs, commands = {}, {}, {}, {}
+local schedulingProbeAnswer, schedulingProbeCalls
 local state, caller, current = 'started', 'example-consumer', 'feather-mysql'
 local response, held, delayed, bridgeCalls = nil, nil, false, 0
 local lastRequest, failExport, resolutions = nil, false, 0
 local selfCheckAnswer
 local readyAnswer = function() return { ok = true, value = { ready = true } } end
+function RegisterCommand(name,fn,restricted) commands[name]={callback=fn,restricted=restricted} end
 function GetConvar(_, default) return default end
 function GetInvokingResource() return caller end
 function GetCurrentResourceName() return current end
@@ -56,7 +58,13 @@ exports = setmetatable({}, {
     __index = function()
         return setmetatable({}, { __index = function(_, name)
             return function(_, ...)
-                if name == 'DriverSelfCheckV1' then
+                if name == 'DriverSchedulingProbeV1' then
+                    local mode,callback=...
+                    schedulingProbeCalls=(schedulingProbeCalls or 0)+1
+                    if schedulingProbeAnswer then return schedulingProbeAnswer(mode,callback) end
+                    now=now+({inline=7,immediate=11,promise_immediate=19,tick=13,promise_tick=17})[mode]
+                    callback({ok=true,value={mode=mode,probe=true,flag=false,promiseMs=0,queueMs=0}})
+                elseif name == 'DriverSelfCheckV1' then
                     local callback = ...
                     if selfCheckAnswer then callback(selfCheckAnswer()) end
                 elseif name == 'DriverReadyV1' then
@@ -109,7 +117,8 @@ check('five plain DB functions return the specified shapes', function()
     for _, method in ipairs(methods) do assert(type(DB[method]) == 'function') end
     local count = 0
     for _ in pairs(DB) do count = count + 1 end
-    assert(count == 9 and type(DB.transaction) == 'function' and type(DB.raw) == 'function' and MySQL == nil)
+    assert(count == 11 and type(DB.transaction) == 'function' and type(DB.raw) == 'function'
+        and type(DB.stmt) == 'function' and type(DB.batchTransaction) == 'function' and MySQL == nil)
     rows({ { z = 42, a = 1 }, { z = 43 } })
     assert(#DB.query('SELECT ? AS z', 42) == 2)
     assert(DB.one('SELECT ? AS z', 42).z == 42)
@@ -476,6 +485,57 @@ check('devmode turns the log switches on by default and an explicit convar still
     local mixed = configWith({ feather_mysql_devmode = 'true', feather_mysql_log_sql = 'false' })
     assert(mixed.logQueries and not mixed.logSql, 'An explicit false wins over devmode')
     assert(configWith({ feather_mysql_log_queries = 'true' }).logQueries, 'The switches still work without devmode')
+end)
+check('console scheduling probe runs fixed no-SQL samples and preserves normal exports', function()
+    local cmd=commands.feather_mysql_bridge_probe
+    assert(cmd.restricted)
+    local prior=bridgeCalls; schedulingProbeCalls=0
+    local lines=capturePrint(function() cmd.callback(0,{}); pump() end)
+    local result=logs[#logs]
+    assert(result.ok and result.value.readOnly and result.value.sampleCount==3)
+    assert(result.value.modes.inline.medianMs==7 and result.value.modes.immediate.medianMs==11)
+    assert(result.value.modes.promise_immediate.medianMs==19 and schedulingProbeCalls==15 and bridgeCalls==prior)
+    assert(result.value.modes.tick.medianMs==13 and result.value.modes.promise_tick.medianMs==17)
+    assert(#lines==1)
+end)
+check('console scheduling probe rejects player callers extra args and overlap', function()
+    local cmd=commands.feather_mysql_bridge_probe; schedulingProbeCalls=0
+    capturePrint(function()
+        cmd.callback(1,{}); cmd.callback(0,{'inline'})
+        assert(schedulingProbeCalls==0)
+        cmd.callback(0,{}); cmd.callback(0,{})
+        pump()
+    end)
+    assert(schedulingProbeCalls==15)
+end)
+check('console scheduling probe validates false marker and clears busy after failure', function()
+    local cmd=commands.feather_mysql_bridge_probe
+    schedulingProbeAnswer=function(mode,callback)
+        callback({ok=true,value={mode=mode,probe=true,flag=true,promiseMs=0,queueMs=0}})
+    end
+    capturePrint(function() cmd.callback(0,{}); pump() end)
+    assert(logs[#logs].code=='INVALID_PROBE_RESULT')
+    schedulingProbeAnswer=nil
+    capturePrint(function() cmd.callback(0,{}); pump() end)
+    assert(logs[#logs].ok)
+end)
+check('console scheduling probe times out once and ignores late callback', function()
+    local cmd=commands.feather_mysql_bridge_probe; local late
+    schedulingProbeAnswer=function(_,callback) late=callback end
+    local co
+    capturePrint(function() cmd.callback(0,{}); pump() end)
+    assert(late)
+    -- Latest timeout belongs to this outstanding sample; older sample timers
+    -- are deliberately left queued and cannot complete any result twice.
+    timers[#timers]()
+    capturePrint(function() pump() end)
+    assert(logs[#logs].code=='PROBE_TIMEOUT')
+    local before=resolutions
+    late({ok=true,value={}})
+    assert(resolutions==before)
+    schedulingProbeAnswer=nil
+    capturePrint(function() cmd.callback(0,{}); pump() end)
+    assert(logs[#logs].ok)
 end)
 assert(DB.prepare == nil and type(DB.transaction) == 'function' and DB.startTransaction == nil)
 print(('Lua contract tests: %d passed'):format(tests))

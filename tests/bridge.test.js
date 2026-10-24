@@ -8,8 +8,9 @@ const root = path.resolve(__dirname, '..');
 
 const turn = () => new Promise(resolve => setImmediate(resolve));
 
-function runtime({ missingDriver = false, failQuery = false, convars = {}, mysql = null } = {}) {
-    const exported = {}, events = {}, commands = {}, scheduled = [], calls = [], logs = [], errors = [], probes = [], monitors = [];
+function runtime({ missingDriver = false, failQuery = false, convars = {}, mysql = null, clock = Date.now } = {}) {
+    const exported = {}, events = {}, commands = {}, scheduled = [], calls = [], logs = [], errors = [], probes = [], monitors = [], ticks = new Map();
+    let nextTickId = 0;
     let settings;
     let caller = 'feather-mysql';
     class FakeDriver {
@@ -24,6 +25,10 @@ function runtime({ missingDriver = false, failQuery = false, convars = {}, mysql
                 { code: 'ER_DUP_ENTRY', errno: 1062, sqlState: '23000', sqlMessage: "Duplicate entry 'secret' for key 'x'" }));
             return Promise.resolve({ kind: 'rows', rows: [{ answer: 42 }], firstColumn: 'answer' });
         }
+        transactionBatch(...args) {
+            calls.push(['transactionBatch', ...args]);
+            return Promise.resolve([{kind:'rows',rows:[],first:null}]);
+        }
         finish(...args) { calls.push(['finish', ...args]); return Promise.resolve(args[2]); }
         abortOwner(...args) { calls.push(['abortOwner', ...args]); }
         readiness() { return { ready: true, code: null }; }
@@ -35,6 +40,9 @@ function runtime({ missingDriver = false, failQuery = false, convars = {}, mysql
         close() { calls.push('closed'); return Promise.resolve(); }
     }
     const context = {
+        Date: { now: clock },
+        setTick: fn => { const id = nextTickId++; ticks.set(id, fn); return id; },
+        clearTick: id => ticks.delete(id),
         GetResourcePath: () => root, GetCurrentResourceName: () => 'feather-mysql',
         GetInvokingResource: () => caller,
         GetConvar: (name, fallback) => convars[name] ?? (name === 'mysql_connection_string' ? 'mysql://test@localhost/game' : fallback),
@@ -53,7 +61,7 @@ function runtime({ missingDriver = false, failQuery = false, convars = {}, mysql
         },
     };
     vm.runInNewContext(fs.readFileSync(path.join(root, 'bridge/index.js'), 'utf8'), context);
-    return { exported, events, commands, calls, scheduled, logs, errors, probes, monitors, settings, setCaller: name => { caller = name; } };
+    return { exported, events, commands, calls, scheduled, logs, errors, probes, monitors, settings, ticks, setCaller: name => { caller = name; } };
 }
 
 test('bridge binds NULL/false parameters and defers Lua callback to main-thread scheduling', async () => {
@@ -256,7 +264,7 @@ test('deadlock retry is opt-in and its limit is configurable', () => {
 });
 
 test('slow transactions are logged without enabling transaction logging', () => {
-    const { settings, scheduled, logs } = runtime({ convars: { feather_mysql_slow_query_ms: '100' } });
+    const { settings, scheduled, logs } = runtime({ convars: { feather_mysql_slow_transaction_ms: '100' } });
     settings.logTransaction({ transactionId: 't', event: 'COMMIT', resource: 'consumer', durationMs: 50 });
     settings.logTransaction({ transactionId: 't', event: 'QUERY', resource: 'consumer', durationMs: 500 });
     assert.equal(scheduled.length, 0, 'Fast transactions and individual queries stay quiet');
@@ -360,4 +368,172 @@ test('kill attempts are bounded so a struggling database is not flooded', async 
     const { settings } = runtime({ mysql });
     await Promise.all(Array.from({ length: 10 }, (_, i) => settings.options.killQuery(i + 1)));
     assert.equal(peak <= 2, true, `peak side connections ${peak}`);
+});
+
+
+test('scheduler probe compares inline immediate and promise delivery without calling the driver', async () => {
+    let now = 10;
+    const { exported, calls, scheduled } = runtime({ missingDriver: true, clock: () => now });
+    const results = [];
+    exported.DriverSchedulingProbeV1('inline', r => results.push(r));
+    assert.equal(results.length, 1);
+    assert.equal(results[0].value.flag, false);
+    assert.equal(results[0].value.queueMs, 0);
+    exported.DriverSchedulingProbeV1('immediate', r => results.push(r));
+    assert.equal(results.length, 1);
+    now = 25; scheduled.shift()();
+    assert.equal(results[1].value.queueMs, 15);
+    exported.DriverSchedulingProbeV1('promise_immediate', r => results.push(r));
+    assert.equal(scheduled.length, 0);
+    now = 35; await turn();
+    assert.equal(results.length, 2);
+    now = 80; scheduled.shift()();
+    assert.equal(results[2].value.promiseMs, 10);
+    assert.equal(results[2].value.queueMs, 45);
+    assert.equal(results[2].value.mode, 'promise_immediate');
+    assert.equal(calls.length, 0);
+});
+
+test('scheduler probe refuses foreign callers and invalid scheduling modes', async () => {
+    const { exported, calls, scheduled, setCaller } = runtime();
+    const replies = [];
+    setCaller('unrelated-resource');
+    for (const mode of ['inline', 'immediate', 'promise_immediate']) exported.DriverSchedulingProbeV1(mode, r => replies.push(r));
+    await turn();
+    while (scheduled.length) scheduled.shift()();
+    assert.equal(replies.length, 3);
+    for (const r of replies) assert.equal(r.error.code, 'INVALID_CALLER');
+    setCaller('feather-mysql');
+    exported.DriverSchedulingProbeV1('arbitrary', r => replies.push(r));
+    await turn(); scheduled.shift()();
+    assert.equal(replies.at(-1).ok, false);
+    assert.equal(calls.length, 0);
+});
+
+test('scheduler probe isolates failed callbacks without retry or driver access', async () => {
+    const { exported, calls, scheduled, errors } = runtime();
+    let attempted = 0;
+    const fail = () => { attempted++; throw new Error('callback unavailable'); };
+    for (const mode of ['inline', 'immediate', 'promise_immediate']) exported.DriverSchedulingProbeV1(mode, fail);
+    await turn();
+    while (scheduled.length) scheduled.shift()();
+    assert.equal(attempted, 3);
+    assert.equal(errors.length, 3);
+    assert.equal(calls.length, 0);
+});
+
+
+test('tick diagnostics deliver only on tick and remove the empty ticker including ID zero', async () => {
+    let now = 10;
+    const { exported, ticks, calls } = runtime({ clock: () => now });
+    const replies = [];
+    exported.DriverSchedulingProbeV1('tick', r => replies.push(r));
+    assert.equal(replies.length, 0);
+    assert.equal(ticks.has(0), true);
+    now = 25; ticks.get(0)();
+    assert.equal(replies[0].value.queueMs, 15);
+    assert.equal(ticks.size, 0);
+    exported.DriverSchedulingProbeV1('promise_tick', r => replies.push(r));
+    now = 30; await turn();
+    assert.equal(replies.length, 1);
+    now = 40; [...ticks.values()][0]();
+    assert.equal(replies[1].value.promiseMs, 5);
+    assert.equal(replies[1].value.queueMs, 10);
+    assert.equal(ticks.size, 0);
+    assert.equal(calls.length, 0);
+});
+
+test('tick diagnostics bound pending work and drain only eight completions per tick', async () => {
+    const { exported, ticks, scheduled, calls } = runtime();
+    const replies = [];
+    for (let i = 0; i < 17; i++) exported.DriverSchedulingProbeV1('tick', r => replies.push(r));
+    assert.equal(ticks.size, 1);
+    await turn(); scheduled.shift()();
+    assert.equal(replies.length, 1);
+    assert.equal(replies[0].error.driverCode, 'PROBE_BUSY');
+    [...ticks.values()][0]();
+    assert.equal(replies.length, 9);
+    assert.equal(ticks.size, 1);
+    [...ticks.values()][0]();
+    assert.equal(replies.length, 17);
+    assert.equal(ticks.size, 0);
+    assert.equal(calls.length, 0);
+});
+
+test('tick diagnostics defer reentrant work to a later tick and isolate callback failure', () => {
+    const { exported, ticks, errors } = runtime();
+    let delivered = 0;
+    exported.DriverSchedulingProbeV1('tick', () => {
+        delivered++;
+        exported.DriverSchedulingProbeV1('tick', () => delivered++);
+        throw new Error('callback unavailable');
+    });
+    [...ticks.values()][0]();
+    assert.equal(delivered, 1);
+    assert.equal(errors.length, 1);
+    assert.equal(ticks.size, 1);
+    [...ticks.values()][0]();
+    assert.equal(delivered, 2);
+    assert.equal(ticks.size, 0);
+});
+
+test('resource stop discards diagnostic work and pending promise continuation without a driver', async () => {
+    const { exported, ticks, events } = runtime({ missingDriver: true });
+    let replies = 0;
+    exported.DriverSchedulingProbeV1('tick', () => replies++);
+    exported.DriverSchedulingProbeV1('promise_tick', () => replies++);
+    events.onResourceStop('feather-mysql');
+    await turn();
+    assert.equal(ticks.size, 0);
+    assert.equal(replies, 0);
+});
+
+test('foreign tick diagnostics cannot start a ticker', async () => {
+    const { exported, ticks, scheduled, setCaller } = runtime();
+    setCaller('bcc-stables');
+    const replies = [];
+    for (const mode of ['tick', 'promise_tick']) exported.DriverSchedulingProbeV1(mode, r => replies.push(r));
+    await turn(); while (scheduled.length) scheduled.shift()();
+    assert.equal(ticks.size, 0);
+    assert.equal(replies.length, 2);
+    for (const r of replies) assert.equal(r.error.code, 'INVALID_CALLER');
+});
+
+
+test('resource stop during a diagnostic callback prevents later batch delivery', () => {
+    const { exported, ticks, events } = runtime({ missingDriver: true });
+    let replies = 0;
+    exported.DriverSchedulingProbeV1('tick', () => { replies++; events.onResourceStop('feather-mysql'); });
+    exported.DriverSchedulingProbeV1('tick', () => replies++);
+    [...ticks.values()][0]();
+    assert.equal(replies, 1);
+    assert.equal(ticks.size, 0);
+});
+
+
+test('transaction batch bridge keeps attributed owner connection ID and normalized NULL parameters', async () => {
+    const { exported, calls, scheduled } = runtime();
+    let response;
+    exported.DriverTransactionBatchV1('consumer', 'tx-1', { count: 1,
+        statements: [{ sql: 'SELECT ?, ?', count: 2, parameters: [{ isNull: true }, { value: false }] }] }, r => response=r);
+    await turn(); scheduled.shift()();
+    assert.equal(response.ok, true);
+    assert.equal(calls[0][0], 'transactionBatch');
+    assert.equal(calls[0][1], 'consumer');
+    assert.equal(calls[0][2], 'tx-1');
+    assert.deepEqual(Array.from(calls[0][3][0].parameters), [null, false]);
+});
+
+test('transaction batch bridge refuses foreign callers and oversized counts before driver access', async () => {
+    const { exported, calls, scheduled, setCaller } = runtime();
+    const replies=[];
+    setCaller('untrusted');
+    exported.DriverTransactionBatchV1('forged', 'tx', { count: 1 }, r => replies.push(r));
+    await turn(); scheduled.shift()();
+    assert.equal(replies[0].error.code, 'INVALID_CALLER');
+    setCaller('feather-mysql');
+    exported.DriverTransactionBatchV1('consumer', 'tx', { count: 33 }, r => replies.push(r));
+    await turn(); scheduled.shift()();
+    assert.equal(replies[1].ok, false);
+    assert.equal(calls.length, 0);
 });

@@ -407,3 +407,87 @@ test('retrying is specific to the two lock error codes, not statement errors gen
     await assert.rejects(driver.run('INSERT INTO t VALUES (1)', []), { code: 'ER_DUP_ENTRY' });
     assert.equal(calls.acquired, 1);
 });
+
+
+test('transaction batch executes in order on one retained connection and leaves commit to caller', async () => {
+    const {driver,calls}=fixture();
+    const tx=await driver.begin('owner');
+    const rows=await driver.transactionBatch('owner',tx.id,[{sql:'SELECT A',parameters:[]},{sql:'SELECT B',parameters:[false]}]);
+    assert.equal(rows.length,2);
+    assert.equal(calls.acquired,1);
+    assert.deepEqual(calls.executions.map(r=>r[0]),['START TRANSACTION','SELECT A','SELECT B']);
+    assert.equal(driver.transactions.get(tx.id).phase,'active');
+    assert.equal(driver.transactions.get(tx.id).queries,2);
+    assert.equal(await driver.finish('owner',tx.id,true),true);
+    await driver.close();
+});
+
+test('transaction batch stops after failing statement and preserves confirmed rollback', async () => {
+    const {driver,calls}=fixture(async sql=> { if(sql==='FAIL') throw lockError(); return [[{answer:42}],[{name:'answer'}]]; });
+    const tx=await driver.begin('owner');
+    await assert.rejects(driver.transactionBatch('owner',tx.id,[{sql:'SELECT A',parameters:[]},{sql:'FAIL',parameters:[]},{sql:'NEVER',parameters:[]}]),
+        e=>e.code==='ER_LOCK_DEADLOCK' && e.rollbackConfirmed===true && e.outcome==='rolled_back');
+    assert.deepEqual(calls.executions.map(r=>r[0]),['START TRANSACTION','SELECT A','FAIL','ROLLBACK']);
+    await assert.rejects(driver.finish('owner',tx.id,false),e=>e.rollbackConfirmed===true);
+    await driver.close();
+});
+
+test('transaction batch rejects foreign owner and bounds inputs without executing statements', async () => {
+    const {driver,calls}=fixture(); const tx=await driver.begin('owner');
+    await assert.rejects(driver.transactionBatch('foreign',tx.id,[{sql:'SELECT A',parameters:[]}]),{code:'TRANSACTION_OWNER'});
+    await assert.rejects(driver.transactionBatch('owner',tx.id,[]),{code:'INVALID_ARGUMENT'});
+    await assert.rejects(driver.transactionBatch('owner',tx.id,Array(33).fill({sql:'SELECT A',parameters:[]})),{code:'INVALID_ARGUMENT'});
+    assert.equal(calls.executions.length,1);
+    await driver.finish('owner',tx.id,false); await driver.close();
+});
+
+test('ordinary query and commit cannot interleave a pending batch', async () => {
+    for(const kind of ['query','finish','batch']) {
+        let release;
+        const {driver}=fixture(()=>new Promise(resolve=>release=resolve));
+        const tx=await driver.begin('owner');
+        const pending=driver.transactionBatch('owner',tx.id,[{sql:'SELECT A',parameters:[]},{sql:'SELECT B',parameters:[]}]);
+        const failed=assert.rejects(pending,{code:'TRANSACTION_BUSY'});
+        await delay(1);
+        const other=kind==='query' ? driver.transactionQuery('owner',tx.id,'SELECT C',[]) :
+            kind==='finish' ? driver.finish('owner',tx.id,true) : driver.transactionBatch('owner',tx.id,[{sql:'SELECT C',parameters:[]}]);
+        await assert.rejects(other,{code:'TRANSACTION_BUSY'});
+        release([[{answer:42}],[{name:'answer'}]]);
+        await failed; await driver.close();
+    }
+});
+
+test('batch timeout prevents later statements and keeps unknown failure semantics', async () => {
+    const {driver,calls}=fixture(()=>new Promise(()=>{})); driver.transactionTimeoutMs=10;
+    const tx=await driver.begin('owner');
+    await assert.rejects(driver.transactionBatch('owner',tx.id,[{sql:'SELECT A',parameters:[]},{sql:'NEVER',parameters:[]}]),{code:'TRANSACTION_TIMEOUT'});
+    assert.equal(calls.executions.some(r=>r[0]==='NEVER'),false);
+    await driver.close();
+});
+
+
+test('batch reservation also blocks commit in the gap between completed statements', async () => {
+    const {driver,calls}=fixture(); const tx=await driver.begin('owner');
+    const one=driver.transactionQuery.bind(driver); let once=false;
+    driver.transactionQuery=async (...args)=> {
+        const value=await one(...args);
+        if(!once) {
+            once=true;
+            assert.equal(driver.transactions.get(tx.id).busy,false);
+            await assert.rejects(driver.finish('owner',tx.id,true),{code:'TRANSACTION_BUSY'});
+        }
+        return value;
+    };
+    await assert.rejects(driver.transactionBatch('owner',tx.id,[{sql:'SELECT A',parameters:[]},{sql:'NEVER',parameters:[]}]),{code:'TRANSACTION_BUSY'});
+    assert.equal(calls.executions.some(r=>r[0]==='COMMIT' || r[0]==='NEVER'),false);
+    await driver.close();
+});
+
+test('provider shutdown during batch rejects once and never runs remaining statements', async () => {
+    const {driver,calls}=fixture(()=>new Promise(()=>{})); const tx=await driver.begin('owner');
+    const pending=driver.transactionBatch('owner',tx.id,[{sql:'SELECT A',parameters:[]},{sql:'NEVER',parameters:[]}]);
+    const rejected=assert.rejects(pending,{code:'RESOURCE_STOPPED'});
+    await delay(1); await driver.close(); await rejected;
+    assert.equal(calls.executions.some(r=>r[0]==='NEVER'),false);
+    assert.equal(calls.destroyed,1);
+});

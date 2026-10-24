@@ -98,6 +98,28 @@ exports('TransactionQueryV1', function(id, method, sql, parameters, callback)
     end)
 end)
 
+exports('TransactionBatchV1', function(id, statements, callback)
+    local context,finish,fail=operation('transaction.batch',nil,callback)
+    if not context then return end
+    if type(id)~='string' or id=='' then fail('INVALID_ARGUMENT','Invalid transaction ID'); return end
+    local batch,err=FeatherMySQL.validateBatch(statements)
+    if not batch then fail('INVALID_ARGUMENT',err); return end
+    bridge('DriverTransactionBatchV1',table.pack(context.resource,id,batch),function(payload)
+        if type(payload)~='table' or #payload~=batch.count then fail('BRIDGE_ERROR','Invalid batch response'); return end
+        local results={}
+        for index=1,batch.count do
+            local item=payload[index]
+            if type(item)~='table' or (item.kind~='rows' and item.kind~='write') then
+                fail('BRIDGE_ERROR','Invalid batch result'); return
+            end
+            local ok,value,resultError=pcall(FeatherMySQL.result,'raw',item)
+            if not ok or resultError or type(value)~='table' then fail('BRIDGE_ERROR','Invalid batch result'); return end
+            results[index]=value
+        end
+        finish(results)
+    end,fail)
+end)
+
 exports('FinishTransactionV1', function(id, commit, callback)
     local context, finish, fail = operation('transaction.finish', nil, callback)
     if not context then return end
@@ -158,3 +180,55 @@ AddEventHandler('onResourceStop', function(resource)
         fail('RESOURCE_STOPPED', 'Database resource stopped; write outcome may be unknown')
     end
 end)
+
+
+-- Console-only scheduler comparison. No SQL, connection or driver mutation.
+-- Normal Execute/Transaction/Ready callback delivery remains unchanged.
+local bridgeProbeBusy=false
+RegisterCommand(provider:gsub('[^%w]+','_')..'_bridge_probe',function(source,args)
+    if source~=0 then return end
+    if #args~=0 then print(('[%s] bridge_probe accepts no arguments.'):format(provider)); return end
+    if bridgeProbeBusy then print(('[%s] bridge_probe busy.'):format(provider)); return end
+    bridgeProbeBusy=true
+    CreateThread(function()
+        local ok,result=pcall(function()
+            local output={readOnly=true,sampleCount=3,modes={}}
+            for _,mode in ipairs({'inline','immediate','promise_immediate','tick','promise_tick'}) do
+                local samples,ordered={},{}
+                for index=1,3 do
+                    local deferred=promise.new()
+                    local answered=false
+                    local began=GetGameTimer()
+                    local function finish(response)
+                        if answered then return end
+                        answered=true
+                        deferred:resolve(response)
+                    end
+                    SetTimeout(5000,function() finish({ok=false,error={code='PROBE_TIMEOUT'}}) end)
+                    local called=pcall(function()
+                        local driver=exports[provider]
+                        driver.DriverSchedulingProbeV1(driver,mode,finish)
+                    end)
+                    if not called then finish({ok=false,error={code='PROBE_UNAVAILABLE'}}) end
+                    local response=Citizen.Await(deferred)
+                    local elapsed=GetGameTimer()-began
+                    local v=type(response)=='table' and response.value
+                    if type(response)~='table' or response.ok~=true or type(v)~='table'
+                        or v.mode~=mode or v.probe~=true or v.flag~=false
+                        or type(v.promiseMs)~='number' or v.promiseMs<0
+                        or type(v.queueMs)~='number' or v.queueMs<0 then
+                        local err=type(response)=='table' and response.error
+                        return {ok=false,code=type(err)=='table' and err.code or 'INVALID_PROBE_RESULT',mode=mode}
+                    end
+                    samples[index]={roundTripMs=elapsed,promiseMs=v.promiseMs,queueMs=v.queueMs}
+                    ordered[index]=elapsed
+                end
+                table.sort(ordered)
+                output.modes[mode]={samples=samples,minMs=ordered[1],medianMs=ordered[2],maxMs=ordered[3]}
+            end
+            return {ok=true,value=output}
+        end)
+        bridgeProbeBusy=false
+        print(('[%s] bridge_probe %s'):format(provider,json.encode(ok and result or {ok=false,code='PROBE_FAILED'})))
+    end)
+end,true)

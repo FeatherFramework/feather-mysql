@@ -299,6 +299,19 @@ function DB.transaction(callback)
         function tx.raw(sql, ...)
             return query('raw', sql, ...)
         end
+        -- One Lua/JS round trip for independent statements on this transaction's
+        -- connection. Results use DB.raw shapes; validation still occurs in Lua.
+        function tx.batch(statements)
+            if state.closed then raise(failure('TRANSACTION_CLOSED', 'Transaction is closed')) end
+            if state.error then raise(state.error) end
+            local ok,value=pcall(callExport,'TransactionBatchV1',transaction.id,statements)
+            if not ok then
+                if type(value)~='table' then value=failure('BRIDGE_ERROR',tostring(value)) end
+                state.error=state.error or value
+                raise(state.error)
+            end
+            return value
+        end
         local ok, result = pcall(callback, tx)
         if not ok then
             if type(result) == 'table' and type(result.code) == 'string' and type(result.message) == 'string' then

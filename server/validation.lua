@@ -41,3 +41,31 @@ function FeatherMySQL.validate(method, sql, parameters)
     end
     return { sql = sql, parameters = packed, count = count }
 end
+
+
+-- A bounded group of independent raw statements inside an existing transaction.
+-- Validate every statement before dispatching any SQL, including dense arrays.
+function FeatherMySQL.validateBatch(statements)
+    if type(statements)~='table' then return nil,'Batch must be a dense statement array' end
+    local count=0
+    for key in pairs(statements) do
+        if type(key)~='number' or key%1~=0 or key<1 then return nil,'Batch must be a dense statement array' end
+        count=count+1
+    end
+    if count<1 or count>32 then return nil,'Batch requires 1 to 32 statements' end
+    local packed,totalSql,totalParameters={},0,0
+    for index=1,count do
+        local statement=statements[index]
+        if type(statement)~='table' then return nil,'Batch must be a dense statement array' end
+        for key in pairs(statement) do
+            if key~='sql' and key~='params' then return nil,'Use DB.stmt to construct batch statements' end
+        end
+        if type(statement.params)~='table' then return nil,'Use DB.stmt to construct batch statements' end
+        local request,err=FeatherMySQL.validate('raw',statement.sql,statement.params)
+        if not request then return nil,err end
+        totalSql,totalParameters=totalSql+#request.sql,totalParameters+request.count
+        if totalSql>131072 or totalParameters>1024 then return nil,'Batch SQL or parameter limit exceeded' end
+        packed[index]=request
+    end
+    return {count=count,statements=packed}
+end

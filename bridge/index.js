@@ -134,6 +134,19 @@ exports('DriverTransactionBeginV1', (owner, callback) => {
 exports('DriverTransactionQueryV1', (owner, id, request, callback) => {
     dispatch(callback, db => db.transactionQuery(owner, id, request.sql, parameters(request)));
 });
+exports('DriverTransactionBatchV1', (owner, id, batch, callback) => {
+    dispatch(callback, db => {
+        if (!batch || !Number.isInteger(batch.count) || batch.count < 1 || batch.count > 32) {
+            throw { code: 'INVALID_ARGUMENT' };
+        }
+        const statements = [];
+        for (let i = 0; i < batch.count; i++) {
+            const request = batch.statements[i];
+            statements.push({ sql: request.sql, parameters: parameters(request) });
+        }
+        return db.transactionBatch(owner, id, statements);
+    });
+});
 exports('DriverTransactionFinishV1', (owner, id, commit, callback) => {
     dispatch(callback, db => db.finish(owner, id, commit));
 });
@@ -155,6 +168,84 @@ exports('DriverSelfCheckV1', callback => {
     });
 });
 
+// Diagnostic queue only: normal database completions still use answer().
+// Start/stop the CFX ticker from main-thread export/tick/stop callbacks, never
+// from an asynchronous I/O completion. Empty diagnostics leave no active ticker.
+const PROBE_QUEUE_LIMIT = 16;
+const PROBE_TICK_BATCH = 8;
+let probeTick = null;
+let probePending = 0;
+let probeQueue = [];
+let probeStopped = false;
+function startProbeTick() {
+    if (probeTick !== null) return;
+    probeTick = setTick(() => {
+        // Snapshot the batch so callback reentry cannot drain new work recursively.
+        const batch = probeQueue.splice(0, PROBE_TICK_BATCH);
+        for (const work of batch) {
+            if (probeStopped) break;
+            probePending--;
+            work(); // deliver() isolates a callback exception.
+        }
+        if (probePending === 0 && probeTick !== null) {
+            clearTick(probeTick);
+            probeTick = null;
+        }
+    });
+}
+function stopProbeTick() {
+    probeStopped = true;
+    if (probeTick !== null) clearTick(probeTick);
+    probeTick = null;
+    probePending = 0;
+    probeQueue = [];
+}
+
+// Fixed no-I/O scheduling diagnostic; private to this resource. Inline delivery
+// is safe only here, while still inside the original main-thread export call.
+// Never use that branch for asynchronous driver/database completion.
+exports('DriverSchedulingProbeV1', (mode, callback) => {
+    if (typeof callback !== 'function') return;
+    if (GetInvokingResource() !== resource) return answer(callback, () => Promise.reject({ code: 'INVALID_CALLER' }));
+    if (!['inline', 'immediate', 'promise_immediate', 'tick', 'promise_tick'].includes(mode)) {
+        return answer(callback, () => Promise.reject({ code: 'INVALID_ARGUMENT' }));
+    }
+    const started = Date.now();
+    const deliver = (promiseMs, queued) => {
+        const value = { mode, probe: true, flag: false, promiseMs, queueMs: Date.now() - queued };
+        try { callback({ ok: true, value }); }
+        catch (_) { console.error(`${tag} Scheduling probe callback unavailable.`); }
+    };
+    if (mode === 'tick' || mode === 'promise_tick') {
+        if (probeStopped) return answer(callback, () => Promise.reject({ code: 'PROBE_STOPPED' }));
+        if (probePending >= PROBE_QUEUE_LIMIT) return answer(callback, () => Promise.reject({ code: 'PROBE_BUSY' }));
+        probePending++;
+        try { startProbeTick(); }
+        catch (_) {
+            probePending--;
+            return answer(callback, () => Promise.reject({ code: 'PROBE_SCHEDULER_UNAVAILABLE' }));
+        }
+        const enqueue = () => {
+            if (probeStopped) return; // resource stopped before the promise resumed.
+            const queued = Date.now();
+            const promiseMs = mode === 'promise_tick' ? queued - started : 0;
+            probeQueue.push(() => deliver(promiseMs, queued));
+        };
+        if (mode === 'tick') enqueue();
+        else Promise.resolve().then(enqueue);
+        return;
+    }
+    if (mode === 'inline') return deliver(0, Date.now());
+    if (mode === 'immediate') {
+        const queued = Date.now();
+        return setImmediate(() => deliver(0, queued));
+    }
+    Promise.resolve().then(() => {
+        const queued = Date.now();
+        setImmediate(() => deliver(queued - started, queued));
+    });
+});
+
 // One command per provider name, so two providers can coexist on a server.
 RegisterCommand(`${resource.replace(/[^A-Za-z0-9]+/g, '_')}_diagnostics`, source => {
     if (source !== 0) return;
@@ -162,6 +253,7 @@ RegisterCommand(`${resource.replace(/[^A-Za-z0-9]+/g, '_')}_diagnostics`, source
 }, true);
 
 on('onResourceStop', name => {
+    if (name === resource) stopProbeTick();
     if (!driver) return;
     if (name === resource) driver.close().catch(() => console.error(`${tag} Pool shutdown failed.`));
     else driver.abortOwner(name);

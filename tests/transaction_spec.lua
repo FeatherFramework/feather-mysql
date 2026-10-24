@@ -7,6 +7,7 @@ local failFinish, failBegin, holdQuery, held, malformed = nil, nil, false, nil, 
 -- How many more times request.sql == 'DEADLOCK' fails before it succeeds.
 local deadlocksRemaining = 0
 local lastRequest, lastOwner, resolutions = nil, nil, 0
+function RegisterCommand() end
 function GetConvar(_, default) return default end
 function GetCurrentResourceName() return 'feather-mysql' end
 function GetInvokingResource() return caller end
@@ -95,6 +96,19 @@ exports = setmetatable({}, {
                     elseif tx.closed then callback(rejected('TRANSACTION_CLOSED'))
                     elseif holdQuery then held = callback
                     else callback(result(request, tx)) end
+                elseif name == 'DriverTransactionBatchV1' then
+                    local owner,id,batch=table.unpack(args)
+                    lastOwner=owner
+                    local tx=transactions[id]
+                    if tx.owner~=owner then callback(rejected('TRANSACTION_OWNER')); return end
+                    if tx.closed then callback(rejected('TRANSACTION_CLOSED')); return end
+                    local values={}
+                    for index=1,batch.count do
+                        local reply=result(batch.statements[index],tx)
+                        if not reply.ok then callback(reply); return end
+                        values[index]=reply.value
+                    end
+                    callback(response(values))
                 elseif name == 'DriverTransactionFinishV1' then
                     local owner, id, commit = table.unpack(args)
                     local tx = transactions[id]
@@ -565,5 +579,84 @@ check('malformed rollback success does not permit retry', function()
         assert(runs == 1 and failure.outcome == 'unknown')
         assert(failure.rollbackError.code == 'BRIDGE_ERROR')
     end)
+end)
+check('tx.batch validates every statement before one bridge dispatch and preserves raw results', function()
+    local before=#history
+    DB.transaction(function(tx)
+        local rows=tx.batch({DB.stmt('SELECT ?',nil),DB.stmt('UPDATE t SET n=?',false)})
+        assert(#rows==2 and rows[1][1].z and rows[2].affectedRows==1)
+        assert(lastRequest.parameters[1].value==false and lastOwner==caller)
+        return true
+    end)
+    assert(#history==before+3, 'BEGIN, one batch, FINISH only')
+end)
+check('batch failure cannot be swallowed into commit and stops later SQL', function()
+    local before=#history
+    expect('DATABASE_ERROR',function()
+        DB.transaction(function(tx)
+            pcall(tx.batch,{DB.stmt('FAIL'),DB.stmt('NEVER')})
+            return true
+        end)
+    end)
+    assert(lastRequest.sql=='FAIL' and #history==before+3)
+end)
+check('batch result inspection can roll back instead of committing', function()
+    local last
+    assert(DB.transaction(function(tx)
+        local results=tx.batch({DB.stmt('SELECT 1')})
+        last=results[1][1].z
+        return false
+    end)==false)
+    assert(transactions[last].commit==false)
+end)
+check('retained batch helper refuses a closed transaction', function()
+    local retained
+    assert(DB.transaction(function(tx) retained=tx.batch; return true end))
+    expect('TRANSACTION_CLOSED',function() retained({DB.stmt('SELECT 1')}) end)
+end)
+check('invalid late batch statement refuses before any batch bridge execution', function()
+    local before=#history
+    expect('INVALID_ARGUMENT',function()
+        DB.transaction(function(tx) tx.batch({DB.stmt('SELECT 1'),{sql='SELECT 2',params={bad=true}}}); return true end)
+    end)
+    assert(#history==before+2, 'Only BEGIN and ROLLBACK')
+end)
+check('batch NULL and false parameters retain distinct transport shapes', function()
+    DB.transaction(function(tx)
+        tx.batch({DB.stmt('SELECT ?,?',nil,false)})
+        assert(lastRequest.parameters[1].isNull==true and lastRequest.parameters[2].value==false)
+        return true
+    end)
+end)
+check('batch input bounds and dense arrays fail before dispatch', function()
+    local invalid={ {}, {[2]=DB.stmt('SELECT 1')}, {DB.stmt('SELECT 1'),bad=DB.stmt('SELECT 2')},
+        {DB.stmt(string.rep('x',131073))} }
+    local large={}; for index=1,33 do large[index]=DB.stmt('SELECT 1') end; invalid[#invalid+1]=large
+    local params={}; for index=1,1025 do params[index]=1 end
+    invalid[#invalid+1]={DB.stmt('SELECT ?',table.unpack(params))}
+    for _,batch in ipairs(invalid) do
+        local before=#history
+        expect('INVALID_ARGUMENT',function() DB.transaction(function(tx) tx.batch(batch); return true end) end)
+        assert(#history==before+2)
+    end
+end)
+check('batch deadlock retries only the enclosing transaction after confirmed rollback', function()
+    withRetry(true,1,function()
+        deadlocksRemaining=1; local attempts=0
+        assert(DB.transaction(function(tx)
+            attempts=attempts+1; tx.batch({DB.stmt('DEADLOCK')}); return true
+        end))
+        assert(attempts==2)
+    end)
+end)
+check('malformed batch payload forces rollback even if callback catches it', function()
+    expect('BRIDGE_ERROR',function()
+        DB.transaction(function(tx)
+            malformed=response({{kind='rows',rows={}} ,{kind='unknown'}})
+            pcall(tx.batch,{DB.stmt('SELECT 1'),DB.stmt('SELECT 2')})
+            return true
+        end)
+    end)
+    assert(DB.transaction(function(tx) return #tx.batch({DB.stmt('SELECT 1')})==1 end))
 end)
 print(('Lua transaction contract tests: %d passed'):format(tests))
