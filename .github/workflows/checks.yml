@@ -1,0 +1,35 @@
+name: Regression checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: |
+          npm ci --ignore-scripts
+          sudo apt-get update
+          sudo apt-get install -y liblua5.4-0 mariadb-server
+      - name: Verify provider and transport regressions
+        run: npm test
+      - name: Verify Lua contracts and syntax
+        run: npm run test:lua
+      - name: Verify isolated MariaDB integration
+        run: npm run test:integration
