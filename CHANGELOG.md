@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1-alpha.1 — Recovery regression tooling
+
+- Add isolated COMMIT reply-loss and uncommitted worker-termination tests.
+- Add wire-proxy coverage, safe diagnostics and Windows recovery instructions.
+- Keep runtime provider behavior and dependencies unchanged.
+
 ## 0.1.0 — Initial release
 
 - Standalone FiveM/RedM database resource with a Lua API and a pinned mysql2 transport.
